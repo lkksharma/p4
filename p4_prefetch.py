@@ -155,15 +155,30 @@ class PFCache:
         miss_b = pf_b = 0                        # origin traffic components (post-warmup)
         tokens = 0.0                             # token bucket for bandwidth matching
         pf_issued = pf_useful = pf_wasted = 0
+        # WASTED-PREFETCH AUTOPSY -- the decomposition the joint thesis lives or dies on.
+        # A wasted prefetch failed for one of two reasons, and only ONE of them is our paper:
+        #   correct-but-evicted : the object IS requested later -> the PREDICTION was right and
+        #                         eviction threw it out anyway. Only a JOINT policy recovers this
+        #                         (by protecting it, or by not issuing it under space pressure).
+        #   mispredicted        : the object is never requested again -> the PREDICTOR was wrong.
+        #                         A better prefetcher recovers this. No jointness required.
+        # If correct-but-evicted ~ 0, the corridor is prefetcher quality and the joint framing dies.
+        pf_w_correct = pf_w_mispred = 0
+        early_dist = []
 
         def _evict_one(t):
-            nonlocal used, pf_wasted
+            nonlocal used, pf_wasted, pf_w_correct, pf_w_mispred
             vo = ev.evict_one()
             if vo is None or vo not in cached:
                 return False
             used -= cached.pop(vo); ev.forget(vo)
             if vo in pf_pending:
                 pf_pending.discard(vo); pf_wasted += 1
+                nx = oracle_next(self.positions, vo, t) if self.positions else int(NEVER)
+                if nx < int(NEVER):
+                    pf_w_correct += 1; early_dist.append(nx - t)
+                else:
+                    pf_w_mispred += 1
             return True
 
         def _admit(o, s, t, is_pf):
@@ -226,7 +241,10 @@ class PFCache:
                     # SHRINKS as prefetching succeeds, so the ratio explodes toward infinity.
                     origin_bytes=origin_b, miss_bytes=miss_b, prefetch_bytes=pf_b,
                     pf_issued=pf_issued, pf_useful=pf_useful, pf_wasted=pf_wasted,
-                    pf_precision=pf_useful / max(pf_issued, 1))
+                    pf_precision=pf_useful / max(pf_issued, 1),
+                    # autopsy: why did the wasted prefetches fail?
+                    pf_w_correct=pf_w_correct, pf_w_mispred=pf_w_mispred,
+                    pf_w_correct_med_dist=int(np.median(early_dist)) if early_dist else 0)
 
 
 # ------------------------------------------------------------------------- selftest

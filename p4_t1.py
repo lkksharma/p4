@@ -89,8 +89,14 @@ def main():
                                            pf_byte_rate=rate).run(trace)
     res["Prescient @unlimited"] = PFCache(cap, "belady", Prescient(trace, k=a.k),
                                           positions=positions, sizes=sizes).run(trace)
+    # THE DECISIVE CELL: oracle prefetch under REALISTIC eviction. Completes the 2x2 and splits the
+    # corridor into "better prefetcher" vs "jointness". Without it the corridor's composition is
+    # unknown and a joint RL is a bet, not an experiment.
+    res["S3-FIFO + Prescient@BW"] = PFCache(cap, "s3fifo", Prescient(trace, k=a.k),
+                                            positions=positions, sizes=sizes,
+                                            pf_byte_rate=rate).run(trace)
 
-    order = ["LRU", "LRU + Markov-1", "S3-FIFO", "S3-FIFO + Markov-1",
+    order = ["LRU", "LRU + Markov-1", "S3-FIFO", "S3-FIFO + Markov-1", "S3-FIFO + Prescient@BW",
              "Belady", "Belady + Markov-1", "Prescient @matched-BW", "Prescient @unlimited"]
     print(LINE)
     print(f"  {'arm':24s} {'OHR':>8s} {'BHR':>8s} {'traffic x':>10s} {'pf issued':>11s} "
@@ -127,6 +133,40 @@ def main():
           f"CORRIDOR vs upper bar : {100*(pres-belpf):+.2f} pts")
     if pres - sc < 0.01:
         print("  !! No corridor: a tuned decoupled system already reaches the bound. STOP.")
+    print(LINE)
+
+    # ================= W3 GATE: is the corridor JOINTNESS, or just a better prefetcher? =========
+    # A corridor is necessary but NOT sufficient. If eviction quality and prefetch quality are
+    # ADDITIVE, then tuning them separately is already near-optimal and a joint agent can only
+    # reprint "S3-FIFO + a better prefetcher". The paper needs the INTERACTION to be positive.
+    s3, s3pf = res["S3-FIFO"]["ohr"], res["S3-FIFO + Markov-1"]["ohr"]
+    s3pres = res["S3-FIFO + Prescient@BW"]["ohr"]
+    print("  W3  INTERACTION -- does eviction matter MORE when prefetching is on?")
+    print(f"  {'2x2 OHR':22s} {'no pf':>9s} {'Markov-1':>9s} {'Prescient@BW':>13s}")
+    print(f"  {'S3-FIFO (realistic)':22s} {s3:9.4f} {s3pf:9.4f} {s3pres:13.4f}")
+    print(f"  {'Belady  (oracle)':22s} {bel:9.4f} {belpf:9.4f} {pres:13.4f}")
+    e_none = 100 * (bel - s3)
+    e_mk = 100 * (belpf - s3pf)
+    e_or = 100 * (pres - s3pres)
+    print(f"    eviction gain (Belady - S3-FIFO)   no pf: {e_none:+6.2f}   "
+          f"Markov-1: {e_mk:+6.2f}   Prescient: {e_or:+6.2f} pts")
+    print(f"    INTERACTION  = eviction gain WITH oracle pf - WITHOUT pf = {e_or - e_none:+6.2f} pts")
+    print("      > 0 : eviction and prefetch are COUPLED -> a joint policy has a mechanism.")
+    print("      ~ 0 : SEPARABLE -> decoupled tuning is already near-optimal; the corridor is")
+    print("            prefetcher quality and a joint RL will reprint the decoupled system.")
+
+    # --- the autopsy: name the prize mechanically, on the honest bar ---
+    r = res["S3-FIFO + Markov-1"]
+    w, wc, wm = r["pf_wasted"], r["pf_w_correct"], r["pf_w_mispred"]
+    nreq = max(r["requests"], 1)
+    print(f"  WASTED-PREFETCH AUTOPSY (S3-FIFO + Markov-1, {w:,} wasted of {r['pf_issued']:,}):")
+    print(f"    correct, evicted before use : {wc:8,}  ({100*wc/max(w,1):5.1f}%)  "
+          f"median dist to use {r['pf_w_correct_med_dist']:,} reqs")
+    print(f"      -> JOINTNESS prize: <= {100*wc/nreq:+.2f} OHR pts. An UPPER bound -- retaining")
+    print(f"         these costs cache space, which costs other hits. That tradeoff IS the")
+    print(f"         joint policy's job. If this is ~0, the joint thesis has no prize here.")
+    print(f"    mispredicted (never used)   : {wm:8,}  ({100*wm/max(w,1):5.1f}%)")
+    print(f"      -> PREFETCHER-QUALITY loss: a better predictor fixes these. No jointness needed.")
     print(LINE)
     if struct <= 0:
         print("  VERDICT: NO hits outside Belady's decision space on this trace/config.")
