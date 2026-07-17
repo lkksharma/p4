@@ -69,7 +69,44 @@ class NoPrefetch:
         return ()
 
 
-class Markov1:
+def _rank(counters, top_m):
+    """count table -> {ctx: [(obj, confidence), ...]} sorted by confidence DESC.
+
+    tau is NOT applied here: the table keeps the full top-M with confidences so a tau/k sweep
+    costs ONE table build instead of one per (tau, k). suggest() filters at serve time, which is
+    exactly equivalent because most_common() is count-descending and conf = count/total."""
+    out = {}
+    for ctx, c in counters.items():
+        tot = sum(c.values())
+        out[ctx] = [(x, n / tot) for x, n in c.most_common(top_m)]
+    return out
+
+
+class _MarkovBase:
+    def set_params(self, k=None, tau=None):
+        """Retune WITHOUT rebuilding the table -- what makes the A1 bar sweep affordable."""
+        if k is not None:
+            self.k = k
+        if tau is not None:
+            self.tau = tau
+        return self
+
+    def reset(self):
+        pass
+
+    def _pick(self, cand, cached):
+        out = []
+        for x, conf in cand:
+            if conf < self.tau:
+                break                       # confidence-descending: nothing below clears tau
+            if x not in cached:
+                out.append(x)
+                if len(out) >= self.k:
+                    break
+        return out
+
+
+class Markov1(_MarkovBase):
     """First-order association prefetcher: succ[o] -> top-M objects seen within `window` after o.
     Built on the trace PREFIX only (no leakage). Suggests the top-k unseen-in-cache successors
     whose confidence (count / total) clears tau."""
@@ -84,19 +121,50 @@ class Markov1:
             o = int(ids[i])
             for j in range(i + 1, min(i + 1 + window, cut)):
                 succ[o][int(ids[j])] += 1
-        self.table = {}
-        for o, c in succ.items():
-            tot = sum(c.values())
-            self.table[o] = [(x, n / tot) for x, n in c.most_common(top_m) if n / tot >= tau]
+        self.table = _rank(succ, top_m)
 
     def suggest(self, o, cached, i):
-        out = []
-        for x, _conf in self.table.get(int(o), ()):
-            if x not in cached:
-                out.append(x)
-                if len(out) >= self.k:
-                    break
-        return out
+        return self._pick(self.table.get(int(o), ()), cached)
+
+
+class Markov2(_MarkovBase):
+    """Second-order: context (prev, cur) -> successors. Sharper conditioning than Markov-1 (the
+    pair disambiguates which of o's many successor sets we are in), at the cost of a sparser
+    table -- so it BACKS OFF to first order when the pair context was never seen in training.
+
+    Why this arm exists: if we only sweep tau/k on Markov-1, a reviewer tunes the better predictor
+    for us and the corridor we claimed was fiction. The A1 bar must be the best DECOUPLED system
+    available, not our default config.
+
+    Stateful (tracks prev), so PFCache.run() must reset() it between runs."""
+    name = "markov2"
+
+    def __init__(self, trace, train_frac=0.5, window=16, top_m=16, k=2, tau=0.05):
+        self.k, self.tau = k, tau
+        ids = trace["obj_id"]
+        cut = int(len(ids) * train_frac)
+        s2, s1 = defaultdict(Counter), defaultdict(Counter)
+        for i in range(1, cut):
+            ctx = (int(ids[i - 1]), int(ids[i]))
+            for j in range(i + 1, min(i + 1 + window, cut)):
+                x = int(ids[j])
+                s2[ctx][x] += 1
+                s1[ctx[1]][x] += 1
+        self.t2 = _rank(s2, top_m)
+        self.t1 = _rank(s1, top_m)          # backoff
+        self.table = self.t2
+        self.prev = None
+
+    def reset(self):
+        self.prev = None
+
+    def suggest(self, o, cached, i):
+        o = int(o)
+        cand = self.t2.get((self.prev, o)) if self.prev is not None else None
+        if cand is None:
+            cand = self.t1.get(o, ())
+        self.prev = o
+        return self._pick(cand, cached)
 
 
 class Prescient:
@@ -140,6 +208,10 @@ class PFCache:
         self.pf_rate = pf_byte_rate
 
     def run(self, trace, warmup_frac=0.05) -> dict:
+        reset = getattr(self.pf, "reset", None)
+        if reset:
+            reset()                          # stateful prefetchers (Markov-2) must not carry
+                                             # `prev` across runs when an instance is reused
         cap, pol = self.cap, self.policy
         ids, szs, nxt = trace["obj_id"], trace["size"], trace["next_vtime"]
         n = trace["n"]; warm = int(n * warmup_frac)
