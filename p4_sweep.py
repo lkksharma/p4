@@ -71,7 +71,10 @@ def bw_rate(trace, cap, pos, szs, mk):
 
 
 # ------------------------------------------------------------------ GATE A: the tuned A1 bar
-def gate_a(trace, cap, pos, szs, args):
+def gate_a(trace, cap, pos, szs, args, preds=None):
+    """preds: optional {name: predictor} to sweep INSTEAD of the default Markov-1/2 pair.
+    Callers (p4_strongbar.py) pass supersets -- the bar is the max over everything offered.
+    Default path (preds=None) is unchanged and bit-identical to the pre-refactor runs."""
     print(LINE)
     print("  GATE A  TUNED BAR -- the A1 bar must be the best DECOUPLED system, not our default")
     print(LINE)
@@ -79,17 +82,18 @@ def gate_a(trace, cap, pos, szs, args):
     base_tx = base["origin_bytes"]
     print(f"  S3-FIFO (no prefetch)  OHR {base['ohr']:.4f}   [traffic denominator]")
 
-    t0 = time.time()
-    preds = {}
-    for nm, cls in (("markov1", Markov1), ("markov2", Markov2)):
-        preds[nm] = cls(trace, train_frac=args.train_frac, window=args.window)
-        print(f"  [build] {nm} table: {len(preds[nm].table):,} contexts  ({time.time()-t0:.1f}s)")
+    if preds is None:
+        t0 = time.time()
+        preds = {}
+        for nm, cls in (("markov1", Markov1), ("markov2", Markov2)):
+            preds[nm] = cls(trace, train_frac=args.train_frac, window=args.window)
+            print(f"  [build] {nm} table: {len(preds[nm].table):,} contexts  ({time.time()-t0:.1f}s)")
 
     print(f"  {'predictor':10s} {'tau':>5s} {'k':>3s} {'OHR':>8s} {'traffic x':>10s} "
           f"{'pf prec':>8s} {'admissible':>11s}")
     best = None
     for nm, pf in preds.items():
-        for tau in TAUS:
+        for tau in (args.taus or TAUS):
             for k in KS:
                 r = PFCache(cap, "s3fifo", pf.set_params(k=k, tau=tau),
                             positions=pos, sizes=szs).run(trace)
@@ -190,6 +194,8 @@ def main():
     # inflating our own corridor. 1.15 errs against us: it lets the baseline tune UP, never down.
     p.add_argument("--max-traffic", type=float, default=1.15,
                    help="traffic ceiling the tuned bar must respect (vs same-policy no-pf arm)")
+    p.add_argument("--taus", type=lambda s: tuple(float(x) for x in s.split(",")), default=None,
+                   help="override the Gate A tau grid (comma-separated), e.g. 0.05,0.06,0.07,0.08,0.09")
     p.add_argument("--k", type=int, default=2, help="k for the fixed-config 2x2 arms")
     p.add_argument("--tau", type=float, default=0.05, help="tau for the fixed-config 2x2 arms")
     p.add_argument("--window", type=int, default=16)
