@@ -65,9 +65,15 @@ def main():
 
     # pass 1: the no-prefetch arms establish the traffic BASELINE per policy
     res = {}
-    for name, pol in (("LRU", "lru"), ("Belady", "belady")):
+    for name, pol in (("LRU", "lru"), ("S3-FIFO", "s3fifo"), ("Belady", "belady")):
         res[name] = PFCache(cap, pol, NoPrefetch(), positions=positions, sizes=sizes).run(trace)
-    base_traffic = {"lru": res["LRU"]["origin_bytes"], "belady": res["Belady"]["origin_bytes"]}
+    base_traffic = {"lru": res["LRU"]["origin_bytes"],
+                    "s3fifo": res["S3-FIFO"]["origin_bytes"],
+                    "belady": res["Belady"]["origin_bytes"]}
+    # S3-FIFO + Markov-1 = the HONEST separate-combined bar (guide A1): heuristic-SOTA evictor
+    # + a tuned prefetcher, each tuned independently. This is what the joint agent must beat.
+    res["S3-FIFO + Markov-1"] = PFCache(cap, "s3fifo", mk, positions=positions,
+                                        sizes=sizes).run(trace)
 
     # pass 2: prefetch arms. The prescient bound is BANDWIDTH-MATCHED to LRU+Markov-1's prefetch
     # traffic -- unlimited-bandwidth prescient trivially reaches OHR 1.0 and bounds nothing.
@@ -84,8 +90,8 @@ def main():
     res["Prescient @unlimited"] = PFCache(cap, "belady", Prescient(trace, k=a.k),
                                           positions=positions, sizes=sizes).run(trace)
 
-    order = ["LRU", "LRU + Markov-1", "Belady", "Belady + Markov-1",
-             "Prescient @matched-BW", "Prescient @unlimited"]
+    order = ["LRU", "LRU + Markov-1", "S3-FIFO", "S3-FIFO + Markov-1",
+             "Belady", "Belady + Markov-1", "Prescient @matched-BW", "Prescient @unlimited"]
     print(LINE)
     print(f"  {'arm':24s} {'OHR':>8s} {'BHR':>8s} {'traffic x':>10s} {'pf issued':>11s} "
           f"{'pf prec':>8s} {'wasted':>10s}")
@@ -110,6 +116,17 @@ def main():
     print(f"  Prescient @matched-BW {pres:.4f} vs Belady {bel:.4f} = {100*(pres-bel):+.2f} pts "
           f"(oracle evict+prefetch at LRU+Markov-1's bandwidth; a BOUND, not OPT --")
     print(f"                        joint OPT is intractable, which is the thesis)")
+    print("-" * 100)
+    # ---- the A1 corridor: what the joint agent must beat, and its ceiling ----
+    sc = res["S3-FIFO + Markov-1"]["ohr"]
+    print(f"  A1 BAR (honest)     S3-FIFO+Markov-1 = {sc:.4f}   <- the joint agent must beat THIS")
+    print(f"  A1 BAR (upper)      Belady+Markov-1  = {belpf:.4f}   <- upper bound on ANY decoupled")
+    print(f"                      system (no evictor beats Belady). Beat it => beat them all.")
+    print(f"  CEILING             Prescient@BW     = {pres:.4f}")
+    print(f"  CORRIDOR vs honest bar : {100*(pres-sc):+.2f} pts     "
+          f"CORRIDOR vs upper bar : {100*(pres-belpf):+.2f} pts")
+    if pres - sc < 0.01:
+        print("  !! No corridor: a tuned decoupled system already reaches the bound. STOP.")
     print(LINE)
     if struct <= 0:
         print("  VERDICT: NO hits outside Belady's decision space on this trace/config.")
@@ -122,8 +139,9 @@ def main():
         print("    reason to exist. Necessary condition met; the RL now has a real job.")
     else:
         print("  VERDICT: BOTH headrooms positive. Prefetch adds hits Belady cannot express AND")
-        print("    pays even under realistic eviction. The bar for W4 is LRU+Markov-1 (separate-")
-        print("    combined), NOT Belady: the joint agent must beat the tuned decoupled system.")
+        print("    pays under realistic eviction. W4's bar is S3-FIFO+Markov-1 (the honest")
+        print("    separate-combined), NOT LRU+Markov-1 and NOT Belady. Report OHR *with* traffic:")
+        print("    a strong evictor alone can Pareto-dominate a weak evictor + prefetcher.")
     print(LINE)
 
 

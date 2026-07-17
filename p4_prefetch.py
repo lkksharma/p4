@@ -133,7 +133,7 @@ class PFCache:
         scores far below an arm that spreads the same bytes over the whole trace. That is not
         bandwidth matching -- it is front-loading, and it made an ORACLE prefetcher score below a
         heuristic one (the impossible result that exposed the bug)."""
-        assert policy in ("lru", "belady")
+        assert policy in ("lru", "belady", "s3fifo")
         self.cap, self.policy = int(capacity_bytes), policy
         self.pf = prefetcher or NoPrefetch()
         self.positions, self.sizes = positions, sizes
@@ -145,10 +145,10 @@ class PFCache:
         n = trace["n"]; warm = int(n * warmup_frac)
         oracle = pol == "belady"
 
-        cached: OrderedDict = OrderedDict()      # obj -> size
+        from p4_evict import make_evictor
+        ev = make_evictor(pol, cap, self.positions)   # evictor owns ORDER; PFCache owns bytes
+        cached: dict = {}                        # obj -> size (membership + byte accounting)
         used = 0
-        key = {}                                 # obj -> current belady key (next access)
-        heap = []
         pf_pending = set()                       # prefetched, not yet used
         hits = reqs = 0
         hit_b = tot_b = 0
@@ -158,34 +158,25 @@ class PFCache:
 
         def _evict_one(t):
             nonlocal used, pf_wasted
-            while cached:
-                if oracle:
-                    while heap:
-                        negx, vo = heapq.heappop(heap)
-                        if vo in cached and key.get(vo) == -negx:
-                            used -= cached.pop(vo); key.pop(vo, None)
-                            if vo in pf_pending:
-                                pf_pending.discard(vo); pf_wasted += 1
-                            return
-                    vo, vs = cached.popitem(last=False); used -= vs
-                else:
-                    vo, vs = cached.popitem(last=False); used -= vs
-                if vo in pf_pending:
-                    pf_pending.discard(vo); pf_wasted += 1
-                return
+            vo = ev.evict_one()
+            if vo is None or vo not in cached:
+                return False
+            used -= cached.pop(vo); ev.forget(vo)
+            if vo in pf_pending:
+                pf_pending.discard(vo); pf_wasted += 1
+            return True
 
         def _admit(o, s, t, is_pf):
             nonlocal used
             if s > cap:
                 return False
             while used + s > cap and cached:
-                _evict_one(t)
+                if not _evict_one(t):
+                    break
             if used + s > cap:
                 return False
             cached[o] = s; used += s
-            if oracle:
-                k = oracle_next(self.positions, o, t)
-                key[o] = k; heapq.heappush(heap, (-k, o))
+            ev.admit(o, s, t)
             if is_pf:
                 pf_pending.add(o)
             return True
@@ -201,10 +192,10 @@ class PFCache:
                     hits += 1; hit_b += s
                 if o in pf_pending:                           # a prefetch paid off
                     pf_pending.discard(o); pf_useful += 1
-                if not oracle:
-                    cached.move_to_end(o)
+                if oracle:
+                    ev.touch(o, i)                            # refresh next-access key
                 else:
-                    key[o] = nx; heapq.heappush(heap, (-nx, o))
+                    ev.hit(o)
             else:                                             # ---- MISS ----
                 if counted:
                     miss_b += s                               # fetched from origin

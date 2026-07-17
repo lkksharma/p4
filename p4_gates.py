@@ -56,16 +56,23 @@ def reference_lru(trace, cap, warmup_frac=0.05) -> dict:
     return dict(requests=reqs, hits=hits, ohr=hits / max(reqs, 1))
 
 
-def libcachesim_lru(path, cap, limit=None):
-    """Run libCacheSim's own LRU on the same trace. Returns None (with a reason) if unavailable --
-    NEVER silently 'passes'."""
+LCS_CLASS = {"lru": ["LRU"], "s3fifo": ["S3FIFO", "S3Fifo", "s3fifo", "S3_FIFO"]}
+
+
+def libcachesim_policy(path, cap, policy="lru", limit=None):
+    """Run libCacheSim's own implementation of `policy` on the same trace. Returns None (with a
+    reason) if unavailable -- NEVER silently 'passes'."""
     try:
         import libcachesim as lcs
     except Exception as e:
         return None, f"libcachesim not importable ({e}); `pip install libcachesim`"
+    ctor = next((getattr(lcs, n) for n in LCS_CLASS[policy] if hasattr(lcs, n)), None)
+    if ctor is None:
+        avail = [x for x in dir(lcs) if not x.startswith("_")]
+        return None, f"no libcachesim class for {policy!r}; tried {LCS_CLASS[policy]}; available: {avail}"
     try:
         reader = lcs.TraceReader(path, lcs.TraceType.ORACLE_GENERAL_TRACE)
-        cache = lcs.LRU(cache_size=int(cap))
+        cache = ctor(cache_size=int(cap))
         hits = reqs = 0
         for i, req in enumerate(reader):
             if limit and i >= limit:
@@ -75,6 +82,31 @@ def libcachesim_lru(path, cap, limit=None):
         return dict(requests=reqs, hits=hits, ohr=hits / max(reqs, 1)), "ok"
     except Exception as e:
         return None, f"libcachesim present but API call failed ({type(e).__name__}: {e})"
+
+
+def libcachesim_lru(path, cap, limit=None):
+    return libcachesim_policy(path, cap, "lru", limit)
+
+
+def gate_parity_s3fifo(trace, cap, path=None, limit=None):
+    """S3-FIFO is a REIMPLEMENTATION (p4_evict.S3FIFOEvictor) and S3-FIFO has variants -- it must
+    clear the same bar LRU did, or the 'honest A1 bar' it defines is fiction."""
+    from p4_prefetch import NoPrefetch, PFCache
+    print(LINE); print("  W1c  PARITY(S3-FIFO) -- our reimplementation vs libCacheSim"); print(LINE)
+    ours = PFCache(cap, "s3fifo", NoPrefetch()).run(trace, warmup_frac=0.0)
+    if not path:
+        print("  SKIPPED: needs a real trace file (libCacheSim reads from disk)."); return None
+    got, why = libcachesim_policy(path, cap, "s3fifo", limit)
+    if got is None:
+        print(f"  libCacheSim S3-FIFO: SKIPPED -- {why}")
+        print("    !! S3-FIFO+Markov-1 is the HONEST A1 BAR. Until this parity runs, that bar is")
+        print("       unverified and any 'joint beats separate-combined' claim rests on it.")
+        return None
+    ok = ours["hits"] == got["hits"]
+    print(f"  ours        hits={ours['hits']:,}  OHR={ours['ohr']:.6f}")
+    print(f"  libCacheSim hits={got['hits']:,}  OHR={got['ohr']:.6f}")
+    print(f"  W1c: {'PASS -- exact match' if ok else 'FAIL -- our S3-FIFO differs; the A1 bar is NOT trustworthy'}")
+    return ok
 
 
 # ------------------------------------------------------------------------ the gates
@@ -204,14 +236,17 @@ def main():
     pre["n"] = min(a.parity_prefix, trace["n"])
     pre_cap = max(int(footprint_bytes(pre) * a.cache_frac), 1)
     ok_par = gate_parity(pre, pre_cap, path=a.trace, limit=pre["n"])
+    ok_s3 = gate_parity_s3fifo(pre, pre_cap, path=a.trace, limit=pre["n"])
 
     ok_gap = gate_gap(trace, fp)
     ok_pre = gate_prefetch_signal(trace)
 
     print(LINE)
+    s3txt = "PASS" if ok_s3 else ("FAIL" if ok_s3 is False else "skipped")
     print(f"  W1a FORMAT {'PASS' if ok_fmt else 'FAIL'} | W1b PARITY {'PASS' if ok_par else 'FAIL'} "
-          f"| W2 GAP {'PASS' if ok_gap else 'FAIL'} | W2b PREFETCH {'PASS' if ok_pre else 'FAIL'}")
-    allok = ok_fmt and ok_par and ok_gap and ok_pre
+          f"| W1c S3FIFO {s3txt} | W2 GAP {'PASS' if ok_gap else 'FAIL'} "
+          f"| W2b PREFETCH {'PASS' if ok_pre else 'FAIL'}")
+    allok = ok_fmt and ok_par and ok_gap and ok_pre and (ok_s3 is not False)
     print(f"  -> {'ALL GATES PASS: build the RL env on this trace' if allok else 'STOP: a gate failed. Do not build on this trace/config.'}")
     print(LINE)
 
