@@ -222,6 +222,13 @@ class PFCache:
         cached: dict = {}                        # obj -> size (membership + byte accounting)
         used = 0
         pf_pending = set()                       # prefetched, not yet used
+        # COLD-MISS SPLIT: a prefetch of an object that has NEVER been requested yet is
+        # unlearnable by ANY history-based predictor (only a clairvoyant arm can issue it).
+        # Tracking which useful prefetches were cold lets gate_a report the LEARNABLE
+        # corridor alongside the gross one. Pure bookkeeping -- decisions are unchanged.
+        pf_cold = {}                             # pending pf obj -> was never-requested at issue
+        seen = set()                             # objects requested so far
+        pf_cold_hits = 0                         # counted hits credited to cold prefetches
         hits = reqs = 0
         hit_b = tot_b = 0
         miss_b = pf_b = 0                        # origin traffic components (post-warmup)
@@ -245,7 +252,7 @@ class PFCache:
                 return False
             used -= cached.pop(vo); ev.forget(vo)
             if vo in pf_pending:
-                pf_pending.discard(vo); pf_wasted += 1
+                pf_pending.discard(vo); pf_cold.pop(vo, None); pf_wasted += 1
                 nx = oracle_next(self.positions, vo, t) if self.positions else int(NEVER)
                 if nx < int(NEVER):
                     pf_w_correct += 1; early_dist.append(nx - t)
@@ -266,6 +273,7 @@ class PFCache:
             ev.admit(o, s, t)
             if is_pf:
                 pf_pending.add(o)
+                pf_cold[o] = o not in seen
             return True
 
         for i in range(n):
@@ -279,6 +287,8 @@ class PFCache:
                     hits += 1; hit_b += s
                 if o in pf_pending:                           # a prefetch paid off
                     pf_pending.discard(o); pf_useful += 1
+                    if pf_cold.pop(o, False) and counted:
+                        pf_cold_hits += 1
                 if oracle:
                     ev.touch(o, i)                            # refresh next-access key
                 else:
@@ -287,6 +297,7 @@ class PFCache:
                 if counted:
                     miss_b += s                               # fetched from origin
                 _admit(o, s, i, is_pf=False)
+            seen.add(o)
 
             # ---- prefetch hook: after serving the request ----
             if self.pf_rate is not None:
@@ -316,6 +327,7 @@ class PFCache:
                     pf_precision=pf_useful / max(pf_issued, 1),
                     # autopsy: why did the wasted prefetches fail?
                     pf_w_correct=pf_w_correct, pf_w_mispred=pf_w_mispred,
+                    pf_cold_hits=pf_cold_hits,
                     pf_w_correct_med_dist=int(np.median(early_dist)) if early_dist else 0)
 
 

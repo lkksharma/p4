@@ -68,6 +68,27 @@ remaining hits with traffic here. Pre-registered conjunctive rule (corridor ≥8
 > and every remaining LIVE verdict is provisional until it passes the same Markov-3 + fine-τ +
 > LSTM bar (Day 1 runs all three on wiki, cluster50, meta_rprn).
 
+## Strong-bar check #3 — LSTM + Markov-3 + fine τ, three live traces (2026-07-19, `logs/day1_nohup.log`)
+
+**The pre-registered aliveness test. All three PASSED — the corridor is not a weak-predictor
+artifact.** Bar = max over {markov1/2/3, LSTM} × τ(0.01–0.5, incl. 0.06–0.09) × k(1,2,4):
+
+| trace | winning bar | bar OHR | ceiling | corridor | verdict |
+|---|---|---|---|---|---|
+| wiki_2019t | markov2 τ=.06 k=1 | 0.5531 @1.09× | 0.8181 @1.01× | **+26.49** | **LIVE** |
+| cluster50 | markov3 τ=.06 k=1 | 0.7080 @1.02× | 0.9116 @0.99× | **+20.37** | **LIVE** |
+| meta_rprn | markov3 τ=.06 k=1 | 0.6738 @1.03× | 0.9995 @0.66× | **+32.57** | **LIVE** |
+
+The LSTM never took the bar anywhere: wiki peak 0.172 (precision ≤0.42, aggressive configs over
+BW), cluster50 peak 0.459 vs Markov-3's 0.708, meta_rprn peak 0.400 vs 0.674.
+
+**Scope caveat on the LSTM arm (word the paper accordingly):** next-token objective + sample10
+traces = handicap (sampling destroys exact adjacency: cluster50 eval top-1 = 0.0001 despite 99%
+vocab coverage; unsampled meta_rprn got 0.143 yet still gained ~1 pt as a prefetcher — next-token
+accuracy is not the prefetch objective). Claim as *"survives every predictor we fielded,
+including a neural sequence model"*, NOT *"no learnable predictor can close it"*. The
+provably-unlearnable part is the cold slice (below).
+
 ## Mechanism read (revised — the family story was wrong, the property story is better)
 
 Pre-run prediction was "block dead, CDN/KV live." Reality: **liveness is a trace property, not a
@@ -102,9 +123,13 @@ the verdict across all 12:
   within every family, corpses reported).
 - Strong bar #1 (Markov-3 + extended τ): **PASSED on wiki; KILLED cluster26** — the remaining
   five LIVE verdicts are provisional until they clear the same grid (bundled into Day 1).
-- Strong bar #3 (LSTM): **pending — final aliveness gate** (wiki, cluster50, meta_rprn).
+- Strong bar #3 (LSTM + Markov-3 + fine τ): **PASSED on wiki, cluster50, meta_rprn** — the
+  aliveness gate is cleared on one trace per live family.
+- Still provisional (coarse grid only): meta_reag, cluster53, msr_hm_0 — queue the same battery.
+- Cold-miss corridor decomposition: **instrumented** (`pf_cold_hits` in PFCache; gate_a now
+  prints COLD SLICE + LEARNABLE CORRIDOR; `p4_coldsplit.py` retrofits the split onto already-
+  measured corridors in 2 replays). Numbers pending — blocks final abstract wording.
 - Gate B (evict×prefetch interaction, n>1): pending.
-- Cold-miss corridor decomposition: pending (blocks the abstract's claim wording).
 
 ## Run log
 
@@ -115,4 +140,6 @@ the verdict across all 12:
 | 2026-07-18 | Breadth Gate A ×12 | `logs/breadth_summary.txt`, `logs/breadth_nohup.log` |
 | 2026-07-18 | Strong bar Markov-3 wiki | `logs/strongbar_m3_wiki.log` |
 | 2026-07-18 | Markov-3 + fine-τ cluster26 → **flips LIVE→DEAD** | `logs/strongbar_m3_cluster26.log` |
-| — | Day 1 LSTM + Markov-3 + fine-τ bar (wiki, cluster50, meta_rprn) | pending |
+| 2026-07-19 | Day 1 LSTM + Markov-3 + fine-τ bar → **3/3 LIVE** | `logs/day1_nohup.log`, `logs/strongbar_summary.txt` |
+| — | Cold split ×6 live traces (`p4_coldsplit.py`) | pending |
+| — | Strong-bar battery: meta_reag, cluster53, msr_hm_0 | pending |

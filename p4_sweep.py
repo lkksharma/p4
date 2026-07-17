@@ -135,6 +135,15 @@ def gate_a(trace, cap, pos, szs, args, preds=None):
           f"(precision {rbar['pf_precision']:.3f})")
     print(f"  CEILING (iso-BW)    S3-FIFO + Prescient  OHR {ceil['ohr']:.4f} @{ctx:.2f}x  "
           f"(precision {ceil['pf_precision']:.3f})")
+    # Cold slice: ceiling hits from prefetches of never-yet-requested objects. Only a
+    # clairvoyant arm can issue these; no history-based predictor (Markov, LSTM, or a
+    # learned policy) can. Verdict stays on the gross corridor (pre-registered); the
+    # learnable corridor is what the paper's claims must be sized against.
+    cold_pts = 100 * ceil.get("pf_cold_hits", 0) / max(ceil["requests"], 1)
+    print(f"  COLD SLICE          {ceil.get('pf_cold_hits', 0):,} ceiling prefetch-hits were "
+          f"never-yet-requested objects = {cold_pts:.2f} pts unlearnable by any history-based "
+          f"predictor")
+    print(f"  LEARNABLE CORRIDOR  {corridor - cold_pts:+.2f} pts (gross corridor minus cold slice)")
     print(f"  TIMING CORRIDOR     {corridor:+.2f} pts at iso prefetch-bandwidth   "
           f"[pre-registered bar: >= 8.00]")
     print(f"  PARETO              ceiling {'DOMINATES' if dominates else 'does NOT dominate'} "
@@ -146,7 +155,7 @@ def gate_a(trace, cap, pos, szs, args, preds=None):
     print(f"  VERDICT: {'LIVE -- timing pivot survives a tuned baseline.' if live else 'DEAD -- corridor collapses under a tuned baseline. Stop P4.'}")
     print(LINE)
     return dict(bar=rbar["ohr"], pred=nm, tau=tau, k=k, ceiling=ceil["ohr"],
-                corridor=corridor, dominates=dominates, live=live)
+                corridor=corridor, cold_pts=cold_pts, dominates=dominates, live=live)
 
 
 # ------------------------------------------------- GATE B: the interaction 2x2, replayed per trace
