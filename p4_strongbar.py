@@ -30,7 +30,10 @@ import numpy as np
 from p4_prefetch import Markov1, Markov2, _MarkovBase, _rank
 from p4_sweep import gate_a, prep, selftest
 
-STRONG_TAUS = (0.01, 0.02, 0.05, 0.10, 0.20, 0.35, 0.50)
+# 0.06-0.09 included permanently: on cluster26 the winning bar configs sat exactly there
+# (markov2 tau=0.06 @1.14x, markov3 tau=0.05-0.06), flipping a provisional LIVE to DEAD.
+# Every live-trace verdict must clear this grid, not the coarse one.
+STRONG_TAUS = (0.01, 0.02, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.20, 0.35, 0.50)
 
 
 class Markov3(_MarkovBase):

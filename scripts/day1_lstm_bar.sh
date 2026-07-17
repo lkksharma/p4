@@ -7,11 +7,14 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p preds logs
 
+# Default set = the strongest LIVE trace per family after the cluster26 flip:
+# wiki (CDN headline), cluster50 (KV), meta_rprn (CDN/Meta). cluster26 is DEAD
+# (strong bar, 2026-07-18) -- do not spend LSTM compute on it.
 TRACES=("$@")
 if [[ ${#TRACES[@]} -eq 0 ]]; then
-  TRACES=(data/wiki_2019t.oracleGeneral data/cluster26.oracleGeneral.sample10)
-  meta=$(ls data/ | grep -i -m1 "meta" || true)
-  [[ -n "$meta" ]] && TRACES+=("data/$meta")
+  TRACES=(data/wiki_2019t.oracleGeneral)
+  [[ -s data/cluster50.sample10.oracleGeneral ]] && TRACES+=(data/cluster50.sample10.oracleGeneral)
+  [[ -s data/meta_rprn.oracleGeneral ]] && TRACES+=(data/meta_rprn.oracleGeneral)
 fi
 
 for f in "${TRACES[@]}"; do
