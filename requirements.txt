@@ -1,0 +1,4 @@
+numpy>=1.24
+# optional but REQUIRED for the real W1b parity gate:
+# libcachesim
+# for data download: awscli, zstandard
