@@ -112,16 +112,38 @@ what v2 measures — unknown until the re-run.
 **Scope note (unchanged):** OOV cold is unreachable *by a history-based scheduler* (our layer). A
 content-aware predictor could recover some — but that is Job 2 (prediction), a different layer.
 
-**v2 RESULTS (2026-07-19, `bar cold hits = 0` confirmed — metric now honest):**
+⚠ **v2 numbers below use `learnable = gross − cold`, now SUPERSEDED by v3.** That formula is too
+harsh: it treats the gross oracle's cold prefetches as free, but they cost budget. The correct
+learnable ceiling is a **warm-restricted Prescient** (perfect timing, in-vocab objects only, SAME
+byte budget) which reallocates that cold-wasted budget onto warm objects, so v3 learnable ≥ v2.
+v3 re-run pending (`logs/warm_*.log`). Whether it lifts wiki (v2 +7.27) above 8 is unknown and
+NOT assumed — the bar stays at 8; wiki clears on its own or it doesn't.
 
-| trace | churn (objs) | gross | cold | **learnable** | learnable verdict |
-|---|---|---|---|---|---|
-| wiki_2019t | 877k (high) | +26.49 | 19.22 | **+7.27** | **below 8** (near-miss, NOT moved to save it) |
-| cluster50 | 138k (low) | +20.37 | 2.69 | **+17.67** | LIVE |
-| meta_rprn | 1.01M | +32.57 | pending | pending | (predict: dead, high churn) |
-| meta_reag | 736k | +24.51 | pending | pending | (predict: dead) |
-| cluster53 | 140k (low) | +25.72 | pending | pending | (predict: live) |
-| msr_hm_0 | 274k | +10.08 | pending | pending | (predict: below 8) |
+**v2 RESULTS (2026-07-19, all `bar cold hits = 0`) — learnable column now superseded by v3:**
+
+| trace | family | objs | churn=objs/2M | gross | cold | **learnable** | verdict |
+|---|---|---|---|---|---|---|---|
+| cluster53 | KV | 140k | 0.070 | +24.46 | 4.62 | **+19.84** | **LIVE** |
+| cluster50 | KV | 138k | 0.069 | +20.37 | 2.69 | **+17.67** | **LIVE** |
+| wiki_2019t | CDN | 877k | 0.439 | +26.49 | 19.22 | +7.27 | below 8 |
+| meta_rprn | CDN | 1.01M | 0.507 | +32.57 | 27.90 | +4.67 | below 8 |
+| msr_hm_0 | block | 274k | 0.137 | +10.08 | 5.82 | +4.26 | below 8 |
+| meta_reag | CDN | 736k | 0.368 | +24.55 | 20.71 | +3.84 | below 8 |
+
+**LEARNABLE-LIVE SET = {cluster50, cluster53}** — both low-churn Twitter KV. Everything else falls
+below the pre-registered 8-pt bar on the honest metric. wiki held at +7.27 (NOT moved).
+
+**THE CLEAN FINDING (the paper's spine now):** the cold slice — unlearnable compulsory-miss
+elimination — is governed by **object churn** and is nearly monotone in it:
+`churn 0.069→cold 2.69 | 0.070→4.62 | 0.137→5.82 | 0.368→20.71 | 0.439→19.22 | 0.507→27.90`.
+Genuine learnable timing headroom (≥8) survives ONLY where churn is low (≲0.1). On high-churn
+CDN/storage, the celebrated gross corridors are 60–90% clairvoyant compulsory-miss elimination that
+no history-based scheduler — and no RL policy on one — can ever reach. **The gross corridor is a
+mirage on exactly the workloads the field most often cites (CDN).**
+
+**Consequences:** (1) headline = low-churn KV, not wiki/CDN; (2) n=2 live is THIN — expand via the
+other ~52 Twitter clusters (cold-split each, ~4 min) to build a proper low-churn-KV benchmark and
+give the RL method a real eval set; (3) RL scheduler targets cluster50/cluster53 + expanded set.
 
 **THE INVERSION (the paper's real finding):** cold slice tracks **object churn**. Learnable timing
 headroom concentrates in LOW-churn workloads; high-churn CDN corridors are dominated by unlearnable

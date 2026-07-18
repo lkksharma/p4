@@ -57,21 +57,32 @@ def main():
                    pf_byte_rate=rate).run(trace, cold_train_frac=args.train_frac)
     ctx = ceil["origin_bytes"] / max(base["origin_bytes"], 1)
 
+    # LEARNABLE (warm) ceiling: perfect timing, in-vocab objects only, same budget -> reallocates
+    # the cold-wasted budget onto warm objects. This is the honest, budget-fair learnable metric
+    # (>= gross - cold, because gross-minus-cold ignores the reallocation).
+    cut = int(trace["n"] * args.train_frac)
+    tvocab = set(int(x) for x in trace["obj_id"][:cut])
+    warm = PFCache(cap, "s3fifo", Prescient(trace, k=max(KS), vocab=tvocab), positions=pos,
+                   sizes=szs, pf_byte_rate=rate).run(trace, cold_train_frac=args.train_frac)
+    wctx = warm["origin_bytes"] / max(base["origin_bytes"], 1)
+
     corridor = 100 * (ceil["ohr"] - bar["ohr"])
     cold_pts = 100 * ceil["pf_cold_hits"] / max(ceil["requests"], 1)
-    bar_cold = bar["pf_cold_hits"]              # sanity: history-based bar must be ~0
+    naive_learn = corridor - cold_pts                        # the old, too-harsh approximation
+    learnable = 100 * (warm["ohr"] - bar["ohr"])             # the correct, budget-fair number
+    bar_cold = bar["pf_cold_hits"]                           # sanity: history-based bar must be 0
 
-    print(f"  BAR      {args.pred} tau={args.tau} k={args.k}  OHR {bar['ohr']:.4f} @{bar_tx:.2f}x"
-          f"   (must match the strong-bar log; bar cold hits = {bar_cold}, expect 0)")
-    print(f"  CEILING  OHR {ceil['ohr']:.4f} @{ctx:.2f}x   useful pf {ceil['pf_useful']:,} "
-          f"of which cold {ceil['pf_cold_hits']:,}")
-    learnable = corridor - cold_pts
-    verdict = ("still clears 8" if learnable >= 8
-               else "BELOW 8 -- gross verdict was carried by the cold slice")
-    print(f"  GROSS CORRIDOR      {corridor:+.2f} pts")
-    print(f"  COLD SLICE          {cold_pts:.2f} pts (compulsory-miss elimination, "
-          f"clairvoyance-only)")
-    print(f"  LEARNABLE CORRIDOR  {learnable:+.2f} pts   [{verdict}]")
+    print(f"  BAR              {args.pred} tau={args.tau} k={args.k}  OHR {bar['ohr']:.4f} "
+          f"@{bar_tx:.2f}x   (bar cold hits = {bar_cold}, expect 0)")
+    print(f"  GROSS CEILING    OHR {ceil['ohr']:.4f} @{ctx:.2f}x   useful pf {ceil['pf_useful']:,} "
+          f"of which cold {ceil['pf_cold_hits']:,}  -> cold slice {cold_pts:.2f} pts")
+    print(f"  WARM CEILING     OHR {warm['ohr']:.4f} @{wctx:.2f}x   (in-vocab only; cold hits "
+          f"{warm['pf_cold_hits']}, expect 0)")
+    print(f"  GROSS CORRIDOR      {corridor:+.2f} pts   (diagnostic; inflated by cold slice)")
+    print(f"  naive learnable     {naive_learn:+.2f} pts   (gross - cold; too harsh, ignores "
+          f"budget reallocation)")
+    verdict = "CLEARS 8" if learnable >= 8 else "below 8"
+    print(f"  LEARNABLE CORRIDOR  {learnable:+.2f} pts   [{verdict}]  <-- honest budget-fair metric")
 
 
 if __name__ == "__main__":

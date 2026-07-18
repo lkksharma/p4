@@ -129,33 +129,38 @@ def gate_a(trace, cap, pos, szs, args, preds=None):
                    pf_byte_rate=rate).run(trace, cold_train_frac=args.train_frac)
     ctx = ceil["origin_bytes"] / max(base_tx, 1)
     corridor = 100 * (ceil["ohr"] - rbar["ohr"])
-    dominates = ceil["ohr"] > rbar["ohr"] and ctx <= tx
+    cold_pts = 100 * ceil.get("pf_cold_hits", 0) / max(ceil["requests"], 1)
+
+    # LEARNABLE CEILING (the primary, budget-fair metric): perfect timing but restricted to
+    # in-training-vocab objects, SAME byte budget. Reallocates the budget the gross oracle wastes
+    # on unreachable cold objects onto warm ones, so warm >= gross - cold. This is the honest
+    # upper bound for a history-based scheduler; the verdict is sized against IT, not the gross
+    # corridor. (Its cold hits are 0 by construction -- printed as a sanity check.)
+    cut = int(trace["n"] * args.train_frac)
+    tvocab = set(int(x) for x in trace["obj_id"][:cut])
+    warm = PFCache(cap, "s3fifo", Prescient(trace, k=max(KS), vocab=tvocab), positions=pos,
+                   sizes=szs, pf_byte_rate=rate).run(trace, cold_train_frac=args.train_frac)
+    wctx = warm["origin_bytes"] / max(base_tx, 1)
+    learn = 100 * (warm["ohr"] - rbar["ohr"])
+    warm_dom = warm["ohr"] > rbar["ohr"] and wctx <= tx
 
     print(f"  TUNED A1 BAR        {nm} tau={tau} k={k}  OHR {rbar['ohr']:.4f} @{tx:.2f}x  "
           f"(precision {rbar['pf_precision']:.3f})")
-    print(f"  CEILING (iso-BW)    S3-FIFO + Prescient  OHR {ceil['ohr']:.4f} @{ctx:.2f}x  "
-          f"(precision {ceil['pf_precision']:.3f})")
-    # Cold slice: ceiling hits from prefetches of never-yet-requested objects. Only a
-    # clairvoyant arm can issue these; no history-based predictor (Markov, LSTM, or a
-    # learned policy) can. Verdict stays on the gross corridor (pre-registered); the
-    # learnable corridor is what the paper's claims must be sized against.
-    cold_pts = 100 * ceil.get("pf_cold_hits", 0) / max(ceil["requests"], 1)
-    print(f"  COLD SLICE          {ceil.get('pf_cold_hits', 0):,} ceiling prefetch-hits were "
-          f"never-yet-requested objects = {cold_pts:.2f} pts unlearnable by any history-based "
-          f"predictor")
-    print(f"  LEARNABLE CORRIDOR  {corridor - cold_pts:+.2f} pts (gross corridor minus cold slice)")
-    print(f"  TIMING CORRIDOR     {corridor:+.2f} pts at iso prefetch-bandwidth   "
-          f"[pre-registered bar: >= 8.00]")
-    print(f"  PARETO              ceiling {'DOMINATES' if dominates else 'does NOT dominate'} "
-          f"the bar (better OHR at no more traffic)")
-    if not dominates:
-        print("    !! the ceiling buys OHR with traffic -- the corridor is NOT a pure timing")
-        print("       prize. Do not claim it until the arms are matched on origin traffic.")
-    live = corridor >= 8.0 and dominates
-    print(f"  VERDICT: {'LIVE -- timing pivot survives a tuned baseline.' if live else 'DEAD -- corridor collapses under a tuned baseline. Stop P4.'}")
+    print(f"  GROSS CEILING       Prescient(all objs)   OHR {ceil['ohr']:.4f} @{ctx:.2f}x   "
+          f"[cold slice {cold_pts:.2f} pts, unreachable by any history-based predictor]")
+    print(f"  LEARNABLE CEILING   Prescient(warm/vocab)  OHR {warm['ohr']:.4f} @{wctx:.2f}x   "
+          f"(cold hits {warm.get('pf_cold_hits', 0)}, expect 0)")
+    print(f"  GROSS CORRIDOR      {corridor:+.2f} pts   (inflated by the cold slice -- diagnostic)")
+    print(f"  LEARNABLE CORRIDOR  {learn:+.2f} pts at iso prefetch-bandwidth   "
+          f"[pre-registered bar: >= 8.00]  <-- the honest number")
+    print(f"  PARETO(learnable)   warm ceiling {'DOMINATES' if warm_dom else 'does NOT dominate'} "
+          f"the bar")
+    live = learn >= 8.0 and warm_dom
+    print(f"  VERDICT: {'LIVE -- LEARNABLE timing headroom survives a tuned baseline.' if live else 'DEAD -- learnable corridor below the pre-registered bar.'}")
     print(LINE)
     return dict(bar=rbar["ohr"], pred=nm, tau=tau, k=k, ceiling=ceil["ohr"],
-                corridor=corridor, cold_pts=cold_pts, dominates=dominates, live=live)
+                warm_ceiling=warm["ohr"], corridor=corridor, learnable=learn,
+                cold_pts=cold_pts, dominates=warm_dom, live=live)
 
 
 # ------------------------------------------------- GATE B: the interaction 2x2, replayed per trace

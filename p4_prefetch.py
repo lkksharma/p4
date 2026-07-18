@@ -169,11 +169,18 @@ class Markov2(_MarkovBase):
 
 class Prescient:
     """Oracle prefetcher (guide's bound): the <=k soonest-to-be-requested objects not in cache,
-    found by looking ahead in the trace. A BOUND CONSTRUCTION, not a deployable policy."""
+    found by looking ahead in the trace. A BOUND CONSTRUCTION, not a deployable policy.
+
+    vocab: if given, restrict prefetch candidates to objects in this set (the predictor's
+    TRAINING vocabulary). This is the LEARNABLE ceiling -- perfect TIMING but only over objects
+    a history-based predictor could know, at the same byte budget. Because the token bucket is
+    unchanged, budget the unrestricted oracle would spend on unreachable (out-of-vocab) objects
+    is instead spent on warm ones: so warm-Prescient >= (gross ceiling - cold slice). It is the
+    correct, budget-fair upper bound on what a real scheduler can capture. Its cold hits are 0."""
     name = "prescient"
 
-    def __init__(self, trace, k=2, lookahead=2000):
-        self.ids, self.k, self.la = trace["obj_id"], k, lookahead
+    def __init__(self, trace, k=2, lookahead=2000, vocab=None):
+        self.ids, self.k, self.la, self.vocab = trace["obj_id"], k, lookahead, vocab
 
     def suggest(self, o, cached, i):
         out, seen = [], set()
@@ -181,6 +188,8 @@ class Prescient:
             x = int(self.ids[j])
             if x in cached or x in seen:
                 continue
+            if self.vocab is not None and x not in self.vocab:
+                continue                      # warm-restricted: only in-training-vocab objects
             seen.add(x); out.append(x)
             if len(out) >= self.k:
                 break
