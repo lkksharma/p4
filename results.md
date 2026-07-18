@@ -112,9 +112,26 @@ what v2 measures — unknown until the re-run.
 **Scope note (unchanged):** OOV cold is unreachable *by a history-based scheduler* (our layer). A
 content-aware predictor could recover some — but that is Job 2 (prediction), a different layer.
 
-**PENDING + DECISIVE — re-run all six with v2:** wiki (headline; 877k objects, high churn — real
-risk), cluster50, meta_rprn, meta_reag, cluster53, msr_hm_0. Paper thesis hinges on wiki's v2
-learnable number.
+**v2 RESULTS (2026-07-19, `bar cold hits = 0` confirmed — metric now honest):**
+
+| trace | churn (objs) | gross | cold | **learnable** | learnable verdict |
+|---|---|---|---|---|---|
+| wiki_2019t | 877k (high) | +26.49 | 19.22 | **+7.27** | **below 8** (near-miss, NOT moved to save it) |
+| cluster50 | 138k (low) | +20.37 | 2.69 | **+17.67** | LIVE |
+| meta_rprn | 1.01M | +32.57 | pending | pending | (predict: dead, high churn) |
+| meta_reag | 736k | +24.51 | pending | pending | (predict: dead) |
+| cluster53 | 140k (low) | +25.72 | pending | pending | (predict: live) |
+| msr_hm_0 | 274k | +10.08 | pending | pending | (predict: below 8) |
+
+**THE INVERSION (the paper's real finding):** cold slice tracks **object churn**. Learnable timing
+headroom concentrates in LOW-churn workloads; high-churn CDN corridors are dominated by unlearnable
+compulsory-miss elimination. wiki, the former headline, falls to +7.27 (below bar). **Headline
+shifts from wiki/CDN to low-churn KV (cluster50 +17.67, cluster53 pending).** The cold-split is the
+instrument that distinguishes the regimes — that IS the contribution now, not the raw corridor.
+Bar held at ≥8: wiki does not clear, full stop.
+
+**Consequence for the RL method:** retarget from wiki to cluster50/cluster53 — build & demo the
+scheduler where learnable headroom actually exists.
 
 ## Mechanism read (revised — the family story was wrong, the property story is better)
 
