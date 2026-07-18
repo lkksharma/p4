@@ -207,7 +207,7 @@ class PFCache:
         self.positions, self.sizes = positions, sizes
         self.pf_rate = pf_byte_rate
 
-    def run(self, trace, warmup_frac=0.05) -> dict:
+    def run(self, trace, warmup_frac=0.05, cold_train_frac=None) -> dict:
         reset = getattr(self.pf, "reset", None)
         if reset:
             reset()                          # stateful prefetchers (Markov-2) must not carry
@@ -216,6 +216,15 @@ class PFCache:
         ids, szs, nxt = trace["obj_id"], trace["size"], trace["next_vtime"]
         n = trace["n"]; warm = int(n * warmup_frac)
         oracle = pol == "belady"
+        # COLD vocab: objects present in the predictor's TRAINING prefix. An object OUTSIDE it is
+        # out-of-vocabulary -> a table/LSTM predictor has no entry and can NEVER prefetch it; only
+        # a clairvoyant arm can. This is the correct "unlearnable" set. (The earlier "not yet seen
+        # in replay" definition was wrong: a frozen predictor legitimately prefetches an object
+        # ahead of its first LOCAL occurrence, which is why the bar showed nonzero cold hits.)
+        cold_vocab = None
+        if cold_train_frac is not None:
+            cut = int(n * cold_train_frac)
+            cold_vocab = set(int(x) for x in ids[:cut])
 
         from p4_evict import make_evictor
         ev = make_evictor(pol, cap, self.positions)   # evictor owns ORDER; PFCache owns bytes
@@ -226,9 +235,8 @@ class PFCache:
         # unlearnable by ANY history-based predictor (only a clairvoyant arm can issue it).
         # Tracking which useful prefetches were cold lets gate_a report the LEARNABLE
         # corridor alongside the gross one. Pure bookkeeping -- decisions are unchanged.
-        pf_cold = {}                             # pending pf obj -> was never-requested at issue
-        seen = set()                             # objects requested so far
-        pf_cold_hits = 0                         # counted hits credited to cold prefetches
+        pf_cold = {}                             # pending pf obj -> is out-of-training-vocab
+        pf_cold_hits = 0                         # counted hits credited to OOV (cold) prefetches
         hits = reqs = 0
         hit_b = tot_b = 0
         miss_b = pf_b = 0                        # origin traffic components (post-warmup)
@@ -273,7 +281,7 @@ class PFCache:
             ev.admit(o, s, t)
             if is_pf:
                 pf_pending.add(o)
-                pf_cold[o] = o not in seen
+                pf_cold[o] = cold_vocab is not None and o not in cold_vocab
             return True
 
         for i in range(n):
@@ -297,7 +305,6 @@ class PFCache:
                 if counted:
                     miss_b += s                               # fetched from origin
                 _admit(o, s, i, is_pf=False)
-            seen.add(o)
 
             # ---- prefetch hook: after serving the request ----
             if self.pf_rate is not None:

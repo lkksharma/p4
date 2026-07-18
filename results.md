@@ -89,6 +89,33 @@ accuracy is not the prefetch objective). Claim as *"survives every predictor we 
 including a neural sequence model"*, NOT *"no learnable predictor can close it"*. The
 provably-unlearnable part is the cold slice (below).
 
+## COLD SPLIT — the learnable corridor ⚠ v1 RETRACTED (bad definition), v2 re-running
+
+**v1 (2026-07-19, RETRACTED):** first cold-split defined cold = "object not yet requested in
+replay at issue time." WRONG — a frozen predictor legitimately prefetches an object ahead of its
+first LOCAL occurrence (it learned the association in training), so the sanity invariant failed:
+**bar cold hits = 442,188 on wiki, not 0.** That over-counts the cold slice and makes learnable
+corridors far too pessimistic. Retracted numbers (do NOT cite): wiki −10.02, meta_rprn −17.61,
+meta_reag −11.90, msr_hm_0 +0.17, cluster53 +20.29, cluster50 +15.50.
+
+**v2 fix (committed):** cold = object OUT of the predictor's TRAINING-prefix vocabulary (true
+OOV → table/LSTM has no entry → only clairvoyance can prefetch it). This makes **bar cold hits
+exactly 0 by construction** (invariant restored) and counts only the genuinely unlearnable
+compulsory slice on the ceiling. Since train-cold ⊆ replay-cold, every v2 learnable corridor is
+**≥ its retracted v1 value** — the true picture is strictly better than the scary v1 negatives.
+
+**Mechanism the split still exposes (a real 4th inflation mode):** on high-churn traces the iso-BW
+clairvoyant ceiling spends budget prefetching compulsory OOV misses a history-based scheduler
+can never reach. How much of each gross corridor is truly OOV vs. mere prefetch-ahead is exactly
+what v2 measures — unknown until the re-run.
+
+**Scope note (unchanged):** OOV cold is unreachable *by a history-based scheduler* (our layer). A
+content-aware predictor could recover some — but that is Job 2 (prediction), a different layer.
+
+**PENDING + DECISIVE — re-run all six with v2:** wiki (headline; 877k objects, high churn — real
+risk), cluster50, meta_rprn, meta_reag, cluster53, msr_hm_0. Paper thesis hinges on wiki's v2
+learnable number.
+
 ## Mechanism read (revised — the family story was wrong, the property story is better)
 
 Pre-run prediction was "block dead, CDN/KV live." Reality: **liveness is a trace property, not a

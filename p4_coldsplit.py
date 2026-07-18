@@ -47,13 +47,14 @@ def main():
 
     pf = PREDS[args.pred](trace, train_frac=args.train_frac, window=args.window,
                           k=args.k, tau=args.tau)
-    bar = PFCache(cap, "s3fifo", pf, positions=pos, sizes=szs).run(trace)
+    bar = PFCache(cap, "s3fifo", pf, positions=pos, sizes=szs).run(
+        trace, cold_train_frac=args.train_frac)
     bar_tx = bar["origin_bytes"] / max(base["origin_bytes"], 1)
 
     # identical ceiling convention to gate_a: Prescient k=max(KS) at the bar's byte rate
     rate = bar["prefetch_bytes"] / max(trace["n"], 1)
     ceil = PFCache(cap, "s3fifo", Prescient(trace, k=max(KS)), positions=pos, sizes=szs,
-                   pf_byte_rate=rate).run(trace)
+                   pf_byte_rate=rate).run(trace, cold_train_frac=args.train_frac)
     ctx = ceil["origin_bytes"] / max(base["origin_bytes"], 1)
 
     corridor = 100 * (ceil["ohr"] - bar["ohr"])

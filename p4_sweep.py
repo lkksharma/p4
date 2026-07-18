@@ -126,7 +126,7 @@ def gate_a(trace, cap, pos, szs, args, preds=None):
     # bytes and the bar's k would understate the prize twice over.
     rate = rbar["prefetch_bytes"] / max(trace["n"], 1)
     ceil = PFCache(cap, "s3fifo", Prescient(trace, k=max(KS)), positions=pos, sizes=szs,
-                   pf_byte_rate=rate).run(trace)
+                   pf_byte_rate=rate).run(trace, cold_train_frac=args.train_frac)
     ctx = ceil["origin_bytes"] / max(base_tx, 1)
     corridor = 100 * (ceil["ohr"] - rbar["ohr"])
     dominates = ceil["ohr"] > rbar["ohr"] and ctx <= tx
