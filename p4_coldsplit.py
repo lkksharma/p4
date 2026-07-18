@@ -64,12 +64,13 @@ def main():
           f"   (must match the strong-bar log; bar cold hits = {bar_cold}, expect 0)")
     print(f"  CEILING  OHR {ceil['ohr']:.4f} @{ctx:.2f}x   useful pf {ceil['pf_useful']:,} "
           f"of which cold {ceil['pf_cold_hits']:,}")
+    learnable = corridor - cold_pts
+    verdict = ("still clears 8" if learnable >= 8
+               else "BELOW 8 -- gross verdict was carried by the cold slice")
     print(f"  GROSS CORRIDOR      {corridor:+.2f} pts")
     print(f"  COLD SLICE          {cold_pts:.2f} pts (compulsory-miss elimination, "
           f"clairvoyance-only)")
-    print(f"  LEARNABLE CORRIDOR  {corridor - cold_pts:+.2f} pts   "
-          f"[{'still clears 8' if corridor - cold_pts >= 8 else 'BELOW 8 -- gross verdict was '
-          'carried by the cold slice'}]")
+    print(f"  LEARNABLE CORRIDOR  {learnable:+.2f} pts   [{verdict}]")
 
 
 if __name__ == "__main__":
