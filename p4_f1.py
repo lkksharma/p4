@@ -36,22 +36,27 @@ from p4_prefetch import PFCache, Prescient, oracle_next
 from p4_sweep import KS, prep
 
 
-def emit_vocab(pred, tau):
-    """Every object the predictor could NAME at this tau, over all of its context rows -- its full
-    proposable vocabulary, independent of cache state and of the k-limit. This is F1's object set:
-    "a scheduler cannot fetch anything the predictor didn't name" (SPEC 1.1). Every such object is
-    a training-prefix successor by construction, so it is in-training-vocab and F1's cold hits are
-    0 automatically -- the same invariant the bar and warm ceiling satisfy."""
-    emit, seen = set(), set()
-    for attr in ("t3", "t2", "t1", "table"):          # covers Markov-1 (.table) and 2/3 (.t*)
-        tbl = getattr(pred, attr, None)
-        if tbl is None or id(tbl) in seen:
-            continue
-        seen.add(id(tbl))
-        for row in tbl.values():
-            for x, conf in row:
-                if conf >= tau:
-                    emit.add(int(x))
+def emit_vocab(pred, trace, n):
+    """Every object the predictor could NAME under its own real k/tau logic: replay it causally
+    with an ALWAYS-EMPTY cache (so 'x not in cached' never filters a candidate) and harvest every
+    suggest() call's output. This calls the ACTUAL _pick() code path -- correct k-capping and
+    confidence-break logic by construction -- rather than re-deriving it, which is what a static
+    per-row scan over 'conf >= tau, no k limit' silently got wrong (it swept in every table entry
+    above tau, not just the top-k the runtime ever proposes; on wiki at tau=0.05 that inflated
+    519,465 objects, essentially the whole training vocabulary, making F1 collapse onto the warm
+    ceiling by tautology instead of measuring a genuinely restricted candidate set).
+
+    An empty cache never removes a candidate as 'already cached,' so this is the maximal superset
+    of anything the predictor could emit in ANY real run (caching only ever REMOVES candidates
+    from consideration, never adds) -- still a valid, still a TIGHT, upper bound. Every emitted
+    object is a training-prefix successor by construction, so F1's cold hits are 0 automatically."""
+    empty: frozenset = frozenset()
+    emit = set()
+    ids = trace["obj_id"]
+    pred.reset()
+    for i in range(n):
+        for x in pred.suggest(int(ids[i]), empty, i):
+            emit.add(int(x))
     return emit
 
 
@@ -176,7 +181,7 @@ def main():
     # stream mode (diagnostic): the JIT deferral scheduler -- can under-read the true ceiling.
     jit = None
     if args.mode == "vocab":
-        emit = emit_vocab(mk(), args.tau)
+        emit = emit_vocab(mk(), trace, trace["n"])
         f1_pf = Prescient(trace, k=max(KS), vocab=emit)
         f1_name = f"F1 (VOCAB ORACLE, |emit|={len(emit):,})"
     else:
