@@ -36,6 +36,25 @@ from p4_prefetch import PFCache, Prescient, oracle_next
 from p4_sweep import KS, prep
 
 
+def emit_vocab(pred, tau):
+    """Every object the predictor could NAME at this tau, over all of its context rows -- its full
+    proposable vocabulary, independent of cache state and of the k-limit. This is F1's object set:
+    "a scheduler cannot fetch anything the predictor didn't name" (SPEC 1.1). Every such object is
+    a training-prefix successor by construction, so it is in-training-vocab and F1's cold hits are
+    0 automatically -- the same invariant the bar and warm ceiling satisfy."""
+    emit, seen = set(), set()
+    for attr in ("t3", "t2", "t1", "table"):          # covers Markov-1 (.table) and 2/3 (.t*)
+        tbl = getattr(pred, attr, None)
+        if tbl is None or id(tbl) in seen:
+            continue
+        seen.add(id(tbl))
+        for row in tbl.values():
+            for x, conf in row:
+                if conf >= tau:
+                    emit.add(int(x))
+    return emit
+
+
 class JITSchedule:
     """F1 arm: the base predictor's candidates, ORACLE issue timing.
 
@@ -125,9 +144,13 @@ def main():
     ap.add_argument("--k", type=int, required=True)
     ap.add_argument("--window", type=int, default=16)
     ap.add_argument("--train-frac", type=float, default=0.5)
-    ap.add_argument("--lead", type=int, default=1, help="release this many requests before use")
+    ap.add_argument("--mode", choices=("vocab", "stream"), default="vocab",
+                    help="vocab = warm-Prescient over the predictor's object vocabulary (the valid "
+                         "ceiling, bar<=F1<=warm); stream = the JIT deferral scheduler (diagnostic, "
+                         "can under-read via second-order eviction/HOL -- not a clean ceiling)")
+    ap.add_argument("--lead", type=int, default=1, help="[stream] release this many requests before use")
     ap.add_argument("--order", choices=("urgent", "small"), default="urgent",
-                    help="release order; 'small' is the head-of-line-blocking ablation")
+                    help="[stream] release order; 'small' is the head-of-line-blocking ablation")
     ap.add_argument("--blocks", type=int, default=1000)
     ap.add_argument("--resamples", type=int, default=10000)
     ap.add_argument("--seed", type=int, default=0)
@@ -146,9 +169,21 @@ def main():
     rate = bar["prefetch_bytes"] / max(trace["n"], 1)
     bar_tx = bar["origin_bytes"] / max(base["origin_bytes"], 1)
 
-    # ---- F1: same candidates, ORACLE timing, same byte rate ----
-    jit = JITSchedule(mk(), pos, szs, lead=args.lead, order=args.order)
-    f1 = PFCache(cap, "s3fifo", jit, positions=pos, sizes=szs, pf_byte_rate=rate).run(
+    # ---- F1: perfect scheduling over the predictor's OWN object vocabulary, at the bar's rate ----
+    # vocab mode (default, the valid ceiling): Prescient restricted to the predictor's emit set.
+    #   Guaranteed bar <= F1 <= warm-Prescient: same objects the bar can name, timed clairvoyantly;
+    #   a strict subset of the warm ceiling's training-vocab objects.
+    # stream mode (diagnostic): the JIT deferral scheduler -- can under-read the true ceiling.
+    jit = None
+    if args.mode == "vocab":
+        emit = emit_vocab(mk(), args.tau)
+        f1_pf = Prescient(trace, k=max(KS), vocab=emit)
+        f1_name = f"F1 (VOCAB ORACLE, |emit|={len(emit):,})"
+    else:
+        jit = JITSchedule(mk(), pos, szs, lead=args.lead, order=args.order)
+        f1_pf = jit
+        f1_name = "F1 (JIT STREAM ORACLE)"
+    f1 = PFCache(cap, "s3fifo", f1_pf, positions=pos, sizes=szs, pf_byte_rate=rate).run(
         trace, cold_train_frac=tf, return_hits=True)
     f1_tx = f1["origin_bytes"] / max(base["origin_bytes"], 1)
 
@@ -166,18 +201,19 @@ def main():
     d = f1["hits_series"].astype(np.float64) - bar["hits_series"].astype(np.float64)
     lo, hi = block_ci(d, args.blocks, args.resamples, args.seed)
 
-    print(f"\n  {args.trace}   [lead={args.lead} order={args.order}]")
+    print(f"\n  {args.trace}   [mode={args.mode}]")
     print(f"  BAR            {args.pred} tau={args.tau} k={args.k}  OHR {bar['ohr']:.4f} "
           f"@{bar_tx:.2f}x   pf {bar['pf_issued']:,} useful {bar['pf_useful']:,} "
           f"(prec {bar['pf_precision']:.3f})")
-    print(f"  F1 (JIT ORACLE)                     OHR {f1['ohr']:.4f} @{f1_tx:.2f}x   "
+    print(f"  {f1_name:35s} OHR {f1['ohr']:.4f} @{f1_tx:.2f}x   "
           f"pf {f1['pf_issued']:,} useful {f1['pf_useful']:,} (prec {f1['pf_precision']:.3f})")
     print(f"  WARM CEILING (v3)                   OHR {warm['ohr']:.4f} @{warm_tx:.2f}x")
     print(f"\n  F1 CORRIDOR   {f1_corr:+.2f} pts   95% CI [{lo:+.2f}, {hi:+.2f}]")
     print(f"  v3 CORRIDOR   {v3_corr:+.2f} pts")
     print(f"  F1 / v3       {ratio:.1%}   <- fraction of the corridor reachable by TIMING alone")
-    print(f"  oracle dropped {jit.dropped_never:,} of {jit.harvested:,} harvested candidates "
-          f"(never used again)")
+    if jit is not None:
+        print(f"  oracle dropped {jit.dropped_never:,} of {jit.harvested:,} harvested candidates "
+              f"(never used again)")
 
     # ---- invariants: a violation means the ARM is wrong, not the finding ----
     inv = []
@@ -186,7 +222,10 @@ def main():
     if f1["pf_cold_hits"] != 0:
         inv.append(f"F1 cold hits = {f1['pf_cold_hits']}, expect 0")
     if f1["ohr"] < bar["ohr"]:
-        inv.append("OHR(F1) < OHR(bar) -- suspect head-of-line blocking; rerun --order small")
+        hint = ("vocab oracle below bar -- unexpected; check emit set / Prescient vocab wiring"
+                if args.mode == "vocab" else
+                "JIT stream below bar -- second-order eviction/HOL; use --mode vocab (the valid ceiling)")
+        inv.append(f"OHR(F1) < OHR(bar) -- {hint}")
     if f1["ohr"] > warm["ohr"] + 1e-9:
         inv.append("OHR(F1) > OHR(warm ceiling) -- F1 is funding out-of-vocab objects; bug")
     if f1_tx > bar_tx + 0.01:

@@ -104,16 +104,18 @@ class PoolArm:
     """
     name = "f4_pool"
 
-    def __init__(self, base, positions, sizes, rate, mode, arm, ttl, lam, cap_bytes):
+    def __init__(self, base, positions, sizes, rate, mode, arm, ttl, lam, cap_bytes, budget):
         self.base, self.pos, self.sizes = base, positions, sizes
         self.rate, self.mode, self.arm = rate, mode, arm
         self.ttl, self.lam, self.cap = ttl, lam, cap_bytes
+        self.budget = budget          # HARD total-byte cap (= bar prefetch bytes) -> iso-bandwidth
         self.pool: dict = {}          # obj -> (value, size, expiry); insertion order = arrival order
         self.tokens = 0.0
+        self.spent = 0.0              # cumulative prefetch bytes emitted by this arm
         self.densities: list = []     # diagnostic: value/size seen, for calibrating lambda
 
     def reset(self):
-        self.pool, self.tokens, self.densities = {}, 0.0, []
+        self.pool, self.tokens, self.spent, self.densities = {}, 0.0, 0.0, []
         r = getattr(self.base, "reset", None)
         if r:
             r()
@@ -160,18 +162,29 @@ class PoolArm:
         chosen = self._select_sep() if self.arm == "sep" else self._select_joint()
         if not chosen:
             return []
-        for x in chosen:
-            self.tokens -= self.pool[x][1]
+        # Emit smallest-first (PFCache BREAKS when tokens < size, so a large item at the front
+        # starves smaller ones behind it) AND enforce the HARD total-byte budget: neither arm may
+        # exceed the bar's prefetch bytes, so the SEP vs JOINT comparison is iso-bandwidth by
+        # construction -- the gap is pure arbitration, never a spend difference.
+        kept = []
+        for x in sorted(chosen, key=lambda x: self.sizes.get(x, 0)):
+            s = self.pool[x][1]
+            if self.spent + s > self.budget:
+                continue
+            kept.append(x)
+            self.spent += s
+            self.tokens -= s
             del self.pool[x]
-        # emit smallest-first: PFCache BREAKS (not continues) when tokens < size, so a large item
-        # at the front would starve everything behind it in the same request.
-        chosen.sort(key=lambda x: self.sizes.get(x, 0))
-        return chosen
+        return kept
 
     def _select_sep(self):
-        """Separable: each candidate judged alone, in arrival order. No comparison between them."""
+        """Separable threshold rule: fund every candidate whose density v/s clears lambda, taken
+        HIGHEST-DENSITY FIRST (the optimal separable ordering). Funding in arrival order instead
+        is suboptimal and lets JOINT out-pack SEP even with no real arbitration to do -- which is
+        exactly why the clairvoyant control read +14 instead of ~0. Under clairvoyance (v=1) this
+        reduces to smallest-first, identical to JOINT's greedy, so F4(clair) -> ~0 as specified."""
         left, out = self.tokens, []
-        for x, (v, s, _) in self.pool.items():
+        for x, (v, s, _) in sorted(self.pool.items(), key=lambda kv: -kv[1][0] / kv[1][1]):
             if v / s < self.lam:
                 continue
             if s <= left:
@@ -248,9 +261,10 @@ def main():
         trace, cold_train_frac=tf, return_hits=True)
     rate = bar["prefetch_bytes"] / max(trace["n"], 1)
 
+    budget = bar["prefetch_bytes"]                       # the iso-bandwidth ceiling for both arms
     arms = {}
     for arm in ("sep", "joint"):
-        sch = PoolArm(mk(), pos, szs, rate, args.mode, arm, args.ttl, args.lam, cap)
+        sch = PoolArm(mk(), pos, szs, rate, args.mode, arm, args.ttl, args.lam, cap, budget)
         arms[arm] = (PFCache(cap, "s3fifo", sch, positions=pos, sizes=szs, pf_byte_rate=rate).run(
             trace, cold_train_frac=tf, return_hits=True), sch)
 
