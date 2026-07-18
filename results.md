@@ -112,12 +112,51 @@ what v2 measures — unknown until the re-run.
 **Scope note (unchanged):** OOV cold is unreachable *by a history-based scheduler* (our layer). A
 content-aware predictor could recover some — but that is Job 2 (prediction), a different layer.
 
-⚠ **v2 numbers below use `learnable = gross − cold`, now SUPERSEDED by v3.** That formula is too
-harsh: it treats the gross oracle's cold prefetches as free, but they cost budget. The correct
-learnable ceiling is a **warm-restricted Prescient** (perfect timing, in-vocab objects only, SAME
-byte budget) which reallocates that cold-wasted budget onto warm objects, so v3 learnable ≥ v2.
-v3 re-run pending (`logs/warm_*.log`). Whether it lifts wiki (v2 +7.27) above 8 is unknown and
-NOT assumed — the bar stays at 8; wiki clears on its own or it doesn't.
+## v3 LEARNABLE CORRIDOR — warm-restricted Prescient (2026-07-19) ← PRIMARY METRIC
+
+Learnable ceiling = Prescient restricted to in-training-vocab objects, at the bar's byte budget
+(reallocates the budget the gross oracle wastes on unreachable cold objects onto warm ones).
+This is the honest, budget-fair upper bound for a history-based scheduler. Verdict is sized
+against IT. bar cold hits = 0 and warm cold hits = 0 (invariants, verified in every run).
+
+| trace | family | churn | bar | warm ceiling | **v3 learnable** | verdict |
+|---|---|---|---|---|---|---|
+| cluster53 | KV | 0.070 | 0.5973 | 0.7940 | **+19.67** | LIVE |
+| cluster50 | KV | 0.069 | 0.7080 | 0.8836 | **+17.56** | LIVE |
+| wiki_2019t | CDN | 0.439 | 0.5531 | 0.6803 | **+12.72** | **LIVE (revived from +7.27)** |
+| msr_hm_0 | block | 0.137 | 0.8380 | 0.8869 | +4.89 | dead |
+| meta_rprn | CDN | 0.507 | 0.6738 | 0.7169 | +4.32 | dead |
+| meta_reag | CDN | 0.368 | 0.7543 | 0.7906 | +3.63 | dead |
+
+**LIVE SET (final) = {wiki, cluster50, cluster53}** — 3 traces, CDN + KV.
+
+**Mechanism (sharpened — NOT churn):** dead traces are where the tuned bar already saturates the
+warm ceiling (meta_reag 0.754 vs 0.791; msr_hm_0 0.838 vs 0.887; meta_rprn 0.674 vs 0.717 — bar
+captures the warm timing). LIVE traces are where the bar FAILS to schedule exploitable warm reuse
+(wiki 0.553 vs 0.680). Learnable headroom = exploitable warm reuse × predictor's failure to time
+it = exactly the gap an RL scheduler targets. This is the paper's thesis, mechanistically stated.
+
+**wiki revived: +7.27 → +12.72** — its gross oracle wasted 27% of budget on cold objects and wiki
+has enough exploitable warm reuse to absorb the reallocation (+5.4 pts). Predicted even-odds
+BEFORE running; cleared. Bar not moved.
+
+**Correction to an earlier claim:** v3 is NOT strictly ≥ v2. warm > naive only where warm reuse is
+exploitable under budget (wiki); on high-churn traces it ≈ naive or dips a hair (meta_rprn
++4.67→+4.32) via eviction-coupling. The metric helps exactly where real warm timing headroom
+exists — which is the honest behavior.
+
+**Live set now spans CDN + KV** (wiki + Twitter clusters), not "low-churn KV only" — a broader,
+better-defended claim. Headroom lives where warm reuse is exploitable under budget.
+
+## GATE B — interaction 2×2, n=6 (2026-07-19, `logs/gate_b_live.log`)
+
+ALL SIX interactions negative → **substitutes, not complements, is STRUCTURAL** (msr_proj_0 −1.34,
+msr_hm_0 −2.31, wiki −3.88, cluster53 −6.66, cluster50 −7.83, meta_rprn −7.94). Kills JOINT
+eviction+prefetch co-training (original P4 thesis). Does NOT touch the tempo/scheduling pivot
+(fixed evictor + prefetch timing) — if anything supports decoupling. Say this explicitly in paper.
+
+---
+## (superseded) v2 learnable = gross − cold — too harsh, kept for provenance
 
 **v2 RESULTS (2026-07-19, all `bar cold hits = 0`) — learnable column now superseded by v3:**
 

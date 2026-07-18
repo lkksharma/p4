@@ -216,7 +216,7 @@ class PFCache:
         self.positions, self.sizes = positions, sizes
         self.pf_rate = pf_byte_rate
 
-    def run(self, trace, warmup_frac=0.05, cold_train_frac=None) -> dict:
+    def run(self, trace, warmup_frac=0.05, cold_train_frac=None, return_hits=False) -> dict:
         reset = getattr(self.pf, "reset", None)
         if reset:
             reset()                          # stateful prefetchers (Markov-2) must not carry
@@ -246,6 +246,11 @@ class PFCache:
         # corridor alongside the gross one. Pure bookkeeping -- decisions are unchanged.
         pf_cold = {}                             # pending pf obj -> is out-of-training-vocab
         pf_cold_hits = 0                         # counted hits credited to OOV (cold) prefetches
+        # per-request hit indicator over POST-WARMUP requests, for the paired block bootstrap.
+        # Aligned across arms (same trace, same warmup), so warm_hits - bar_hits is the per-request
+        # corridor contribution. Preallocated; hs_idx advances once per counted request.
+        hits_series = np.empty(n - warm, dtype=np.int8) if return_hits else None
+        hs_idx = 0
         hits = reqs = 0
         hit_b = tot_b = 0
         miss_b = pf_b = 0                        # origin traffic components (post-warmup)
@@ -299,7 +304,8 @@ class PFCache:
             if counted:
                 reqs += 1; tot_b += s
 
-            if o in cached:                                   # ---- HIT ----
+            is_hit = o in cached
+            if is_hit:                                        # ---- HIT ----
                 if counted:
                     hits += 1; hit_b += s
                 if o in pf_pending:                           # a prefetch paid off
@@ -314,6 +320,8 @@ class PFCache:
                 if counted:
                     miss_b += s                               # fetched from origin
                 _admit(o, s, i, is_pf=False)
+            if counted and return_hits:
+                hits_series[hs_idx] = is_hit; hs_idx += 1
 
             # ---- prefetch hook: after serving the request ----
             if self.pf_rate is not None:
@@ -343,7 +351,7 @@ class PFCache:
                     pf_precision=pf_useful / max(pf_issued, 1),
                     # autopsy: why did the wasted prefetches fail?
                     pf_w_correct=pf_w_correct, pf_w_mispred=pf_w_mispred,
-                    pf_cold_hits=pf_cold_hits,
+                    pf_cold_hits=pf_cold_hits, hits_series=hits_series,
                     pf_w_correct_med_dist=int(np.median(early_dist)) if early_dist else 0)
 
 
