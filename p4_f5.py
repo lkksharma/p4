@@ -134,6 +134,10 @@ def run(trace, cap, pos, szs, args):
     def mk():
         return PREDS[args.pred](trace, train_frac=tf, window=args.window, k=args.k, tau=args.tau)
 
+    def mk_wide():                               # wider top_m so --wide-k can exceed the 16 default
+        return PREDS[args.pred](trace, train_frac=tf, window=args.window, k=args.k, tau=args.tau,
+                                top_m=args.wide_top_m)
+
     base = PFCache(cap, "s3fifo", None, positions=pos, sizes=szs).run(trace)
     bar = PFCache(cap, "s3fifo", mk(), positions=pos, sizes=szs).run(
         trace, cold_train_frac=tf, return_hits=True)
@@ -162,7 +166,7 @@ def run(trace, cap, pos, szs, args):
 
     best = None
     for kw in args.wide_k:
-        coverable, n_cov = build_coverable(mk(), trace, kw, args.wide_tau)
+        coverable, n_cov = build_coverable(mk_wide(), trace, kw, args.wide_tau)
         f5pf = CoverGatedPrescient(trace, coverable, k=max(KS), lookahead=args.lookahead)
         f5 = PFCache(cap, "s3fifo", f5pf, positions=pos, sizes=szs,
                      pf_byte_rate=(None if args.budget_mode == "total" else rate)).run(
@@ -214,7 +218,7 @@ def run(trace, cap, pos, szs, args):
 def selftest():
     class A:
         trace = "SYNTH"; limit = 60000; cache_frac = 0.01; pred = "markov1"; tau = 0.05; k = 1
-        window = 16; train_frac = 0.5; wide_tau = 0.0; wide_k = [1, 4, 8, 16]
+        window = 16; train_frac = 0.5; wide_tau = 0.0; wide_k = [1, 4, 8, 16]; wide_top_m = 16
         lookahead = 2000; budget_mode = "rate"; blocks = 100; resamples = 500; seed = 0
     a = A()
     trace, cap, pos, szs = prep("SYNTH", a.limit, a.cache_frac)
@@ -234,7 +238,11 @@ def main():
     ap.add_argument("--train-frac", type=float, default=0.5)
     ap.add_argument("--wide-k", default="1,4,8,16",
                     help="comma list of emission fanouts to sweep; the widest is the UPPER bound. "
-                         "Capped by the table's top_m (16) per context.")
+                         "To exceed 16, raise --wide-top-m to match.")
+    ap.add_argument("--wide-top-m", type=int, default=16,
+                    help="successors stored per context in the WIDE predictor. Raise (e.g. 32/64) "
+                         "with --wide-k to push the coverage ceiling further -- the pre-registered "
+                         "escape when the widest net still straddles 8 (as on wiki at top_m=16).")
     ap.add_argument("--wide-tau", type=float, default=0.0,
                     help="confidence floor for WIDE emission. 0.0 = emit the full top-k regardless "
                          "of confidence (the loosest, highest ceiling / true upper bound). Raise to "
