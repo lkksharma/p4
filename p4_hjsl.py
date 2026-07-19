@@ -100,12 +100,22 @@ class HJSL:
             r()
 
     def _quantile(self, row, g):
+        """Lag at the g-quantile of the conditional (used) lag distribution, taken at the bin's
+        LOWER EDGE, not its midpoint.
+
+        The lag bins are log-spaced, so bin 3 spans [13.3, 31.6) -- a 2.4x range -- and uses on
+        these traces cluster near lag~16, i.e. INSIDE that bin and BELOW its midpoint (20.5). Using
+        the midpoint as a wake offset therefore overshoots every use in the lower half of the bin
+        no matter how small g is, which is why dropping gamma 0.75 -> 0.10 barely moved the LATE
+        rate. The costs are asymmetric: arriving late is a total loss (the request is served as a
+        miss before the fetch lands), while arriving early costs nearly nothing here (S(100)=1.000
+        -- prefetched objects are not evicted within 100 requests). Take the conservative edge."""
         f = row[:16]
         tot = f.sum()
         if tot <= 0:
-            return self.mids[-1]
+            return float(LAG_EDGES[0])
         cdf = np.cumsum(f / tot)
-        return float(self.mids[min(int(np.searchsorted(cdf, g)), 15)])
+        return float(LAG_EDGES[min(int(np.searchsorted(cdf, g)), 15)])
 
     def _S(self, deltas):
         deltas = np.maximum(deltas, 0)
