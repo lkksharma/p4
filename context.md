@@ -1,138 +1,225 @@
-# P4 — context & what is running
+# P4 — Context Prompt: the idea, the proven gap, and what's left
 
-**One-line status (2026-07-17):** the *joint* "co-optimize eviction + prefetch" thesis is **dead**
-on MSR (endorsed by peer). What may survive is a **timing** wedge — *predict WHEN to prefetch, not
-WHAT*. Three pre-registered gates decide whether that wedge is a paper. Two run on the GPU box; one
-(lit check) is running in the background here.
-
----
-
-## What is running RIGHT NOW
-
-| what | where | id / how | decides |
-|---|---|---|---|
-| **Lit check** — is "predict WHEN, not what" prior art for object caches? | background deep-research workflow (this machine) | task `wvuuxxzh8`, run `wf_c171d85b-aab` | GATE C below |
-| **Gate A** — tuned-baseline corridor | your GPU box (manual) | `python p4_sweep.py --trace data/msr_proj_0.oracleGeneral --limit 2000000 --gate a` | is the timing corridor real |
-| **Gate B** — interaction 2×2 across 3 trace families | your GPU box (manual, needs 2 more traces) | `python p4_sweep.py --gate b --trace msr --trace wiki --trace twitter --limit 2000000` | is "substitutes not complements" structural |
-
-**Lit-check history:** first launch (`wf_4a0b1417-a0c`) stopped with no completion record when the
-previous session's process exited. A resume-from-runId dropped the `args` and errored with 0 agents
-(args are not stored with a runId — always relaunch by `name`+`args`, not resume, when the prior run
-never produced cached agents). Relaunched fresh as `wvuuxxzh8`.
+*Written 2026-07-19/20. Supersedes the earlier version of this file (2026-07-17), which predates
+the measurement paper, F1/F4, and HJS-L entirely. If you are a fresh reader or a fresh session,
+read this top to bottom — it is self-contained.*
 
 ---
 
-## The story so far (why the joint thesis died)
+## 1. The idea, in one paragraph
 
-The paper's original claim: a single RL policy that *jointly* decides eviction + prefetching beats
-any *decoupled* (separately-tuned evictor + prefetcher) system, because joint optimization is
-intractable and a learned policy can approximate it.
-
-**T1 on `msr_proj_0` (2M reqs, 260,712 objects, footprint 10.97 GB, cache 1% = 109.7 MB):**
-
-```
-arm                        OHR      BHR    traffic×   pf prec   wasted
-LRU                      0.4863   0.2202     1.00        —          0
-LRU + Markov-1           0.6178   0.3646     1.10      0.733   108,888
-S3-FIFO                  0.5516   0.3143     1.00        —          0
-S3-FIFO + Markov-1       0.6709   0.4449     1.10      0.734    97,535   ← honest A1 bar
-S3-FIFO + Prescient@BW   0.7784   0.4989     1.05      0.903    51,817   ← timing ceiling (realistic evict)
-Belady                   0.6229   0.4266     1.00        —          0
-Belady + Markov-1        0.7332   0.5472     1.19      0.586   168,944   ← upper bound on ANY decoupled
-Prescient @matched-BW    0.8363   0.6282     1.03      0.997     1,329
-Prescient @unlimited     1.0000   1.0000     1.94      0.749   313,289
-```
-
-**Two independent kill-arguments (both verified arithmetically by peer):**
-
-1. **Interaction is negative & monotone.** Eviction gain (Belady − S3-FIFO) *shrinks* as prefetch
-   improves: `no-pf +7.13 → Markov-1 +6.22 → Prescient +5.78`. Eviction and prefetching fix the
-   **same misses** → they are **substitutes, not complements**. A joint policy has no coupling to
-   exploit.
-2. **The oracle refuses the "retained prefetch" prize.** Belady is the joint-optimal evictor for
-   prefetched objects (it evicts by true next-access). It converts **31k FEWER** prefetches into
-   hits than S3-FIFO, wastes **73% more** of them, and still **wins by 6.2 pts**. Retaining
-   "correct-but-evicted" prefetches is a *mistake the oracle declines to make*, not an unrealized
-   gain.
-
-**A labeling artifact I shipped and then retracted:** the wasted-prefetch autopsy first counted a
-prefetch as "correct, evicted too early" if the object was *ever* requested again → 57.7%, implying
-a +2.96 pt jointness prize. But median distance-to-use was **116,612 requests** into a ~2,600-object
-cache: those objects were never going to be used from cache. The "prize" was measuring object
-*existence*, not prediction correctness. Same small-n / wrong-label error class as the earlier +64%
-headroom read. **Prize is ≈ 0. Do not build the joint RL (W4).**
+A cache has three decisions: **what to evict** (solved — S3-FIFO), **what to prefetch** (solved
+well enough — Markov tables and an LSTM both saturate quickly), and **given a stream of predicted
+candidates and a hard shared byte budget, which ones get fetched and when** (open — nobody
+schedules this in a principled way). We built an instrument that measures, honestly, how much hit
+rate is on the table from getting that third decision right. Then, rather than jumping straight to
+building an RL agent to capture it, we adopted a discipline — the **Necessity Ladder**: climb one
+rung of model complexity at a time, and only pay for the next rung if a cheap, pre-registered,
+replay-only measurement proves it's needed. Every rung's outcome is a publishable result, including
+"this doesn't work" — that's the point. This project has now killed itself honestly five separate
+times before this idea (CAPO, CLCA, Certifend, the RAO-RL joint-cache flagship, and the original
+"joint eviction+prefetch RL" thesis this same repo started with) — the discipline is not incidental,
+it is the entire reason anything here is trustworthy.
 
 ---
 
-## What survives: the TIMING wedge
+## 2. The proven gap — DONE, this is a separate, submittable paper
 
-A **realistic** evictor (S3-FIFO) + a **perfectly-timed** prefetcher (Prescient@BW) = **0.7784 @
-1.05× traffic**, i.e. **+10.75 pts over the honest bar at LESS traffic**. Prescient beats Belady by
-+21.3 pts for 3% more traffic. Mechanism: **a correctly-timed prefetch is nearly free** — it moves a
-fetch earlier (miss→hit) rather than adding one. Markov-1's failure is not picking wrong objects; it
-is picking right objects at wrong *times* (it over-issues: 368k prefetches @1.10× vs the oracle's
-531k @1.05×). Regression target = **time-to-next-access** (a computable train-time oracle, regressed,
-acted on greedily — same machinery as the v3 RAO lesson, new decision variable).
+This is finished, measured, bootstrap-confirmed, and compiled into a PDF. It does not depend on
+anything below it.
+
+**Instrument.** Pre-registered, iso-bandwidth, adversarially-tuned: the "tuned bar" is the best of
+{Markov-1, Markov-2, Markov-3, an LSTM} × threshold × fanout, capped at 1.15× no-prefetch traffic.
+The **learnable corridor** = (a clairvoyant oracle restricted to objects the predictor could ever
+have learned, at the bar's exact byte rate) − (the tuned bar). Restricting the ceiling to
+in-training-vocabulary objects (not "anything the future contains") is the whole trick — it prices
+out compulsory-miss elimination, which no history-based scheduler can ever reach.
+
+**Result, 12 production traces (CDN, KV, block), pre-registered bar = corridor ≥ 8 pts + Pareto
+dominance:**
+
+| trace | family | tuned bar OHR | learnable ceiling OHR | corridor | 95% CI (block bootstrap) |
+|---|---|---|---|---|---|
+| **cluster53** (Twitter KV) | KV | 0.5973 | 0.7940 | **+19.67** | [+19.41, +19.93] |
+| **cluster50** (Twitter KV) | KV | 0.7080 | 0.8836 | **+17.56** | [+15.78, +19.39] |
+| **wiki_2019t** (Wikipedia CDN) | CDN | 0.5531 | 0.6803 | **+12.72** | [+10.93, +14.52] |
+| msr_hm_0 | block | 0.8380 | 0.8869 | +4.89 | dead |
+| meta_rprn | CDN | 0.6738 | 0.7169 | +4.32 | dead |
+| meta_reag | CDN | 0.7543 | 0.7906 | +3.63 | dead |
+| msr_proj_0, msr_web_2, w105, w87, cluster10, cluster26 | — | — | — | — | dead by 3 other mechanisms (bar-saturation, traffic-bought corridor, degenerate predictability) |
+
+**Live set (final): {wiki_2019t, cluster50, cluster53}** — 3 traces, spanning CDN and KV. All three
+lower bootstrap bounds clear 8 (wiki's is the closest, at +10.93). Gross corridors before the
+warm/cold split were far bigger (up to +32.6) — 14–87% of each was phantom (unreachable compulsory
+misses); the deflation itself, by workload class, is a headline finding.
+
+**Also measured:** eviction and prefetch quality are **substitutes, not complements** (n=6, all
+interactions negative) — kills joint co-optimization, supports treating the evictor as fixed.
+**Lit check:** the instrument is novel; nearest neighbors are Baleen (FAST'24) and Demand-MIN
+(ISCA'18), neither of which does the timing-corridor + warm/cold split. *(4 arXiv-only citations
+still need author-list verification before camera-ready — see `results_p4.md` caveat #4.)*
+
+**Deliverables that exist:** `paper_draft.md` (markdown draft), `paper.tex` + `paper.pdf`
+(compiled, 10 pages, 3 TikZ figures, 3 tables). `results_p4.md` is the full ledger with every
+retraction on the record (v1 cold-split bug, the naive-subtraction-vs-warm-ceiling correction,
+etc.) — that audit trail is itself part of the paper's credibility argument.
+
+**Status: essentially submission-ready**, pending citation verification and a red-team pass. This
+targeted AAAI-27 (abstract Jul 21 / paper Jul 28) — confirm that deadline is still live before
+treating it as final; if it has passed, retarget the next appropriate venue without re-deriving
+anything above.
 
 ---
 
-## The three pre-registered gates (decision rules fixed BEFORE results)
+## 3. The capture-method track (Necessity Ladder) — IN PROGRESS, do not trust the last real-data numbers yet
 
-**GATE A — TUNED BAR.** Our 0.6709 bar used `tau=0.05, k=2` (defaults, not a sweep). The bar must be
-the *best decoupled system available*: `best OHR at ≤1.15× traffic over {Markov-1, Markov-2} × tau ×
-k`. Markov-2 is mandatory — sweeping only Markov-1 lets a reviewer tune the better predictor for us.
-Ceiling is **iso-bandwidth** (Prescient given the tuned bar's prefetch byte-rate) and must **Pareto-
-dominate** (better OHR at no more traffic) or the corridor is a bandwidth difference, not a timing
-prize.
-> **Rule: corridor ≥ 8 pts AND ceiling dominates → timing pivot LIVE. < 8 → P4 DEAD, stop.**
-> (Synthetic smoke: Markov-2 beat the default bar by +4.2 pts at less traffic, collapsing a fake
-> +42 pt corridor to +5.87. Real number is genuinely uncertain — that's a working gate.)
+This is the **separate, later** paper that asks: given the proven corridor above, can any *causal*
+policy actually capture it? It targets AAAI-28 / IAAI-27, not the deadline above.
 
-**GATE B — n > 1.** "Substitutes, not complements" died on **one** MSR block trace. Replay the
-identical 2×2 on a Wikipedia CDN trace + a Twitter KV trace. **Negative on all three families →
-structural**, and that is itself a publishable measurement result (kills the joint-cache-RL direction
-for everyone), not a consolation prize. Mixed → workload-dependent, "structural" is unsupported.
-> Caveat: on variable-size CDN/KV objects Belady is a strong heuristic, **not** a proven optimum
-> (variable-size eviction is NP-hard). Only MSR's uniform 4KB blocks earn the word "optimal".
+### 3.1 The ladder, and where each rung stands
 
-**GATE C — LIT CHECK (running).** Is "predict WHEN, not what" already claimed for object caches?
-Adjudicating DEAP, Pythia (MICRO'21 RL HW prefetch), Voyager/Hashemi (ICML'18), TTL/proactive
-caching, and learned-caching work (LRB, GL-Cache, Baleen, C2DN, …). Verdict target: (a) novel /
-(b) done in hardware prefetching but not object caches / (c) already done for object caches.
-> If (c) → wedge dies. If prior art exists on *when-prefetching*, tighten the ≥8 pt bar.
-
-### Combined outcomes (all pre-committed)
-| corridor (A) | lit (C) | outcome |
+| rung | question | status |
 |---|---|---|
-| ≥ 8 pts | clean | **timing paper LIVE**; substitutes finding (B) becomes a section |
-| ≥ 8 pts | prior art | reframe against it, or stop |
-| < 8 pts | any | **P4 dead**; honest output = the substitutes *measurement study* + Domain-B mechanism note |
+| **F1** | Timing-only ceiling: how much of the corridor is reachable by perfect *scheduling* alone, restricted to what the predictor could ever name? | ✅ **Fixed, verified, trustworthy.** wiki 95.8% of corridor, cluster50 91.2%, cluster53 7.3% (cluster53's corridor is mostly *object-choice*, not timing — a real, informative boundary result). |
+| **F4** | Necessity gap: how much could a *non-separable* (joint/packing) policy add over a per-candidate threshold rule? Bounds what RL could contribute. | ✅ **Fixed, verified, trustworthy.** <1 pt on all 3 live traces → **RL is measurably unnecessary here.** This closes the RL rung of the ladder as a positive, pre-registered, no-training-required finding. |
+| **F2** | Is the *when* (use-lag) learnable at all from causal features? Gates whether HJS-L (the closed-form scheduler) can work. | ⚠️ **Built, but the last real-data run used SUPERSEDED code. Numbers below are not trustworthy — re-run required before drawing any conclusion.** |
+| **HJS-L** | The closed-form hazard-priced scheduler itself: capture fraction of F1, ablations, Pareto/two-axis reporting. | 🔧 **Built (significant recent additions), never run on real trace data.** |
+
+### 3.2 ⚠️ Critical: why the F2 numbers you have are stale
+
+The F2 gate was run once on real data (wiki/cluster50/cluster53) with a hazard model keyed on
+`(recency, frequency, confidence)`. Result at that time: **wiki FAIL** (Spearman 0.065, never-AUC
+0.71), **cluster50 FAIL** (Spearman 0.037, never-AUC **0.389** — *below 0.5*), **cluster53 PASS**
+(Spearman 0.659, never-AUC 0.862).
+
+**Since that run, `p4_hazard.py` was substantially rewritten** (commit `90b3413`, "fixing hazard
+overfit") to fix a real methodological bug: the hazard model had been trained on the *same window*
+the predictor itself trained on. In-sample, high table-confidence means "memorized and reliable";
+out-of-sample it often means "built from too few observations and likely wrong" — the
+confidence→outcome relationship **flips sign** between the two regimes. This is very plausibly
+*exactly* what produced cluster50's AUC of 0.389 (the code now explicitly documents "never-AUC
+lands BELOW 0.5" as the signature of this bug). The fix introduces a proper **three-way split**:
+
+```
+[0, cut)      the PREDICTOR trains here            (unchanged, cut = train_frac * n)
+[cut, hcut)   the HAZARD MODEL trains here          (NEW — on the predictor's out-of-sample behavior)
+[hcut, n)     F2 evaluates here                     (unchanged in spirit, now genuinely held out)
+```
+
+plus a **fixed observation horizon** for the "never" label (a use one million requests away is
+unreachable regardless, and without a fixed horizon the label's meaning silently drifts with
+position in the trace — see the docstring in `harvest()` for the full argument). Both are real
+fixes to real bugs, not tuning.
+
+**Consequence: the wiki/cluster50 FAIL verdicts might reverse, might not — genuinely unknown until
+re-run.** Do not write "F2 fails on wiki/cluster50" into any paper or conclusion until it has been
+re-verified against current code. cluster53's PASS is the least likely to flip (it was decisive,
+not marginal) but should be re-confirmed for consistency regardless.
+
+### 3.3 What HJS-L (`p4_hjsl.py`) has grown into
+
+Beyond the original scheduler design, several rigor additions landed (commits `a87d3d1`,
+`85edd44`, `44c6e11`) that materially change what a capture number will mean:
+
+- **`hazard=` diagnostic modes**: `model` (the real causal policy), `oracle` (true lag, a point
+  mass — reads the future, *never reportable as a result*, exists only to separate "the scheduler
+  design is bad" from "the forecaster is bad"), `point` (learned median only, no distribution
+  shape — tests whether the shape earns its keep).
+- **`budget_mode=`**: `rate` (token bucket, the project's standing iso-BW convention) vs `total`
+  (cumulative cap only, no instantaneous rate limit — the same freedom the unlimited bar already
+  has). This exists because of a **fairness asymmetry**: the bar runs with unlimited instantaneous
+  rate (can burst), while every scheduler arm was capped to the bar's *average* rate — a capped
+  arm can lose a candidate forever if it arrives while the bucket is low, a penalty the bar never
+  pays. `BAR-CAP` (the bar re-run under the same token bucket the schedulers face) isolates this:
+  any gap between BAR and BAR-CAP is charged to the *protocol*, not the *scheduler*. **Report
+  HJS-L against BAR-CAP, not against the unlimited bar**, or a real scheduling win can be masked by
+  a fairness artifact.
+- **Issue autopsy** (`on-time` / `LATE` / `never-used`): separates two distinct failure modes that
+  demand opposite fixes — late issues mean deferral overshoot (lower `--gamma`); never-used issues
+  mean filtering failure (raise `--floor`). Defaults are already tuned once from this signal
+  (`gamma` 0.75→0.10, `floor` 0.05→0.30) using the *quantile bin-edge vs bin-midpoint* insight: log
+  bins are wide, uses cluster near the low end of a bin, and a wake time computed off the midpoint
+  systematically overshoots (see the `_quantile` docstring).
+- **Two-axis (Pareto) reporting**: the pass/fail gate scores OHR alone, but an arm that matches the
+  bar's hit rate on half the prefetch bytes is currently recorded as a failure — which is wrong on
+  a byte-billed system. Both axes are now printed; read the Pareto verdict line, not just capture%.
+
+None of this has touched real trace data yet.
 
 ---
 
-## Files
+## 4. What to do with the checklist — concrete next actions, in order
 
-| file | role |
-|---|---|
-| `p4_cache.py` | trace IO (24B oracleGeneral), footprint, base cache sim |
-| `p4_evict.py` | pluggable evictors: LRU, Belady, S3-FIFO |
-| `p4_prefetch.py` | prefetchers (Markov-1, **Markov-2**, Prescient bound) + PFCache (byte accounting, token-bucket bandwidth match, wasted-prefetch autopsy) + `selftest()` |
-| `p4_gates.py` | W1 kill-tests: format self-check, LRU parity vs libCacheSim, LRU→Belady gap, prefetch-signal, S3-FIFO parity |
-| `p4_t1.py` | the T1 reference table + interaction 2×2 + autopsy (the run that killed the joint thesis) |
-| `p4_sweep.py` | **Gate A** (tuned bar) + **Gate B** (interaction across traces) |
-| `README.md` | W1 scope + data fetch instructions |
+The Phase 1 / Phase 2 / Phase 3 / Phase 4 checklist from earlier stands structurally, but Phase 1
+must be **re-run**, not read from old logs, before Phase 2 means anything.
 
-### Known open items
-- **W1c S3-FIFO parity FAILS by 82 hits / 100k (0.08 pt)** = variant drift, not a broken sim. Does
-  NOT block the build (LRU parity — the env unit test — passes EXACT; the go/no-go uses Belady, not
-  S3-FIFO). But our S3-FIFO number **cannot be printed as "S3-FIFO" in a paper table** until it
-  matches libCacheSim exactly. Fix = sweep variant knobs (small_frac, ghost size, freq-reset-on-
-  promote) against libCacheSim. Keep the gate RED until fixed.
-- **Markov-2 table is memory-hungry** (~1M pair-contexts × 16). If a CDN trace OOMs, drop
-  `--train-frac` to 0.25.
-- Git: remote `github.com/lkksharma/p4.git`, branch `main`. Latest commit `d9f14ca` (Gates A+B).
-  **Push from Mac before pulling on the box.**
+### Phase 1 (re-run — mandatory before anything else)
 
-## Environment note
-Prepare/self-test locally in the `badminton` conda env; **run heavy jobs on the GPU box** (user runs
-them). Local python with numpy/torch: `/usr/local/bin/python3`.
+```bash
+cd /workspace/p4 && git pull && mkdir -p haz logs
+
+python p4_hazard.py --trace data/wiki_2019t.oracleGeneral        --pred markov2 --tau 0.05 --k 1 --out haz/wiki.npz \
+  2>&1 | tee logs/hazard_wiki_v2.log
+python p4_hazard.py --trace data/cluster50.sample10.oracleGeneral --pred markov3 --tau 0.06 --k 1 --out haz/cluster50.npz \
+  2>&1 | tee logs/hazard_cluster50_v2.log
+python p4_hazard.py --trace data/cluster53.sample10.oracleGeneral --pred markov2 --tau 0.20 --k 1 --out haz/cluster53.npz \
+  2>&1 | tee logs/hazard_cluster53_v2.log
+```
+
+Read the `!! never-rate gap ... extrapolating` warning if it prints — that's the code's own
+self-check that the 3-way split is doing its job. Compare the new Spearman/AUC numbers to §3.2
+above; do not assume they'll match.
+
+**Decision point:** for each trace, F2 PASS or FAIL. Only traces that PASS proceed to Phase 2.
+- All 3 FAIL → HJS-L has no viable target on any live trace; write that up as the finding (still
+  publishable — see the pre-registered fork table in `SPEC_f1_f4_oracles.md` §6, and note F4
+  already separately confirmed RL isn't the answer either, so this would mean *no* causal policy —
+  closed-form or learned — can capture this corridor on these traces, which is itself a strong,
+  citable negative result).
+- ≥1 PASS → proceed to Phase 2 on the passing trace(s) only.
+
+### Phase 2 (only on F2-passing traces)
+
+```bash
+python p4_hjsl.py --trace data/<TRACE> --pred <PRED> --tau <TAU> --k <K> --haz haz/<trace>.npz \
+  2>&1 | tee logs/hjsl_<trace>.log
+```
+
+Read, in order: (1) invariants pass, (2) issue autopsy — tune `--gamma`/`--floor` if late-rate or
+never-rate dominates, (3) **HJS-L vs BAR-CAP** (the like-for-like number, not vs. the unlimited
+bar), (4) capture % of F1, (5) the two-axis Pareto verdict. Ablations worth running once a base
+config looks sane: `--defer none`, `--survival none`, `--hazard oracle` (diagnostic ceiling only,
+never a reported result), `--hazard point`, `--budget-mode total`.
+
+**Pre-registered pass bar (unchanged): capture ≥ 25% of F1, CI excluding zero.**
+
+### Phase 3 / Phase 4 (writing, unchanged from before)
+
+Only start once Phase 2 has a stable, tuned, reported number on at least one trace. Reuse Gate C's
+related-work map; add HJS-L's method section; report F1/F4/F2 as the paper's own necessity-gating
+methodology (this triad — measure timing-headroom, measure RL-necessity, measure when-learnability,
+*before* building anything — is arguably the more novel contribution than the scheduler itself).
+
+---
+
+## 5. House rules this project has earned the hard way (do not relitigate these)
+
+1. **Every gate is pre-registered before the run that could satisfy it.** Thresholds don't move
+   after seeing a number, in either direction — not to save a discouraging trace, not to make a
+   flattering one "final."
+2. **A gate that never kills anything is not trusted.** This project's credibility rests on a
+   visible trail of self-caught bugs (the synthetic +42 that became −0.02; the cluster26 flip; the
+   retracted cold-split v1; the F1 vocab-cap bug; the F4 SEP-ordering bug; now the hazard
+   train/eval overlap bug) — each one caught before it reached a paper, not after.
+2b. **When a gate fails, ask "is the gate broken?" before "is the hypothesis dead?"** — but only
+   once per gate, with a specific, falsifiable fix, not indefinitely. Recency rescued F2 on
+   cluster53; the 3-way split may or may not rescue wiki/cluster50 — find out by running it, don't
+   assume either way.
+3. **No n=1 generalization.** "Structural" requires replication across families; a single trace is
+   a data point, not a claim.
+4. **Report diagnostics as diagnostics.** `hazard=oracle` reads the future and exists only to
+   separate forecaster quality from scheduler quality — it must never appear as a capture number in
+   a table.
+5. **Fairness controls are not optional decoration.** BAR-CAP exists because an unfair comparison
+   (unlimited bar vs. rate-capped scheduler) would make a real win invisible or a fake loss look
+   real. Always report against the like-for-like control.
