@@ -50,7 +50,7 @@ class HJSL:
 
     def __init__(self, base, pos, szs, rate, haz, budget,
                  gamma=0.10, lead_safety=1, floor=0.30, max_wait=200000,
-                 defer=True, survive=True, hazard="model"):
+                 defer=True, survive=True, hazard="model", budget_mode="rate"):
         self.base, self.pos, self.szs, self.rate = base, pos, szs, rate
         self.budget, self.gamma = budget, gamma
         self.lead_safety, self.floor, self.max_wait = lead_safety, floor, max_wait
@@ -63,6 +63,16 @@ class HJSL:
         # scheduler design -- and the paper reports "the when is hard to learn", not "scheduling
         # does not work". Never report `oracle` as a result; it reads the future.
         self.hazard = hazard
+        # BUDGET MODE -- which resource constraint the scheduler faces.
+        #   rate  : a token bucket accruing `rate` bytes/request (the project's iso-BW convention).
+        #   total : NO rate limit; only the cumulative byte cap binds -- the SAME freedom the bar
+        #           already has (the bar runs pf_byte_rate=None and simply happens to spend `budget`).
+        # This distinction is not cosmetic. Under `rate`, a candidate arriving while the bucket is
+        # low is skipped and, for a stateless prefetcher, LOST FOREVER -- a penalty the unlimited
+        # bar never pays. Equal totals, unequal freedom. `total` equalises the freedom and is the
+        # like-for-like comparison; `rate` is retained because the F1/v3 ceilings were measured
+        # under it and the numbers must stay comparable.
+        self.budget_mode = budget_mode
 
         self.hist = haz["hist"]                                    # (7,7,17) p(lag|conf,size)
         self.mids = np.sqrt(LAG_EDGES[:-1] * LAG_EDGES[1:])        # (16,) geometric bin midpoints
@@ -151,7 +161,8 @@ class HJSL:
         return float((resid * Sd).sum()), p_future
 
     def suggest(self, o, cached, i):
-        self.tokens += self.rate
+        # in `total` mode the instantaneous constraint is lifted; only self.spent vs self.budget binds
+        self.tokens = float("inf") if self.budget_mode == "total" else self.tokens + self.rate
 
         # (1) harvest candidates with confidence, schedule a wake time
         ctx = capture_ctx(self.base)
@@ -257,6 +268,22 @@ def run(trace, cap, pos, szs, haz, args):
     rate = bar["prefetch_bytes"] / max(trace["n"], 1)
     budget = bar["prefetch_bytes"]
 
+    # FAIRNESS CONTROL -- the comparison is not symmetric and this measures by how much.
+    # The bar runs with pf_byte_rate=None: UNLIMITED instantaneous rate, free to burst as many
+    # prefetches as it likes in any one request. Every scheduler arm runs under a token bucket at
+    # the bar's AVERAGE rate, so it must spread the identical total budget evenly over time. Equal
+    # totals, unequal freedom. If prefetch demand is bursty, the capped arm is starved exactly when
+    # candidates arrive and then accrues tokens it can no longer use -- which is precisely the
+    # "spent 0.52x of budget while losing" signature the scheduler arms show.
+    # bar_capped = the same bar under the SAME token bucket the schedulers face. Any gap between
+    # bar and bar_capped is charged to the PROTOCOL, not to the scheduler.
+    # In `total` mode the bar IS the like-for-like control (it already runs unlimited-rate under a
+    # de-facto total budget), so bar_capped collapses onto it and the extra replay is skipped.
+    bmode = getattr(args, "budget_mode", "rate")
+    barc = bar if bmode == "total" else PFCache(
+        cap, "s3fifo", mk(), positions=pos, sizes=szs, pf_byte_rate=rate).run(
+        trace, cold_train_frac=tf, return_hits=True)
+
     # F1 timing-only ceiling (the honest denominator) -- vocab oracle, same as p4_f1.py
     emit = emit_vocab(mk(), trace, trace["n"])
     f1 = PFCache(cap, "s3fifo", Prescient(trace, k=max(KS), vocab=emit), positions=pos, sizes=szs,
@@ -264,14 +291,21 @@ def run(trace, cap, pos, szs, haz, args):
 
     sch = HJSL(mk(), pos, szs, rate, haz, budget, gamma=args.gamma, floor=args.floor,
                max_wait=args.max_wait, defer=(args.defer != "none"),
-               survive=(args.survival != "none"), hazard=getattr(args, "hazard", "model"))
-    hj = PFCache(cap, "s3fifo", sch, positions=pos, sizes=szs, pf_byte_rate=rate).run(
+               survive=(args.survival != "none"), hazard=getattr(args, "hazard", "model"),
+               budget_mode=bmode)
+    # total mode: PFCache's bucket is disabled so the scheduler's own cumulative cap is the only
+    # constraint -- otherwise the two buckets compose and the rate limit silently applies anyway.
+    hj = PFCache(cap, "s3fifo", sch, positions=pos, sizes=szs,
+                 pf_byte_rate=(None if bmode == "total" else rate)).run(
         trace, cold_train_frac=tf, return_hits=True)
 
     bar_tx = bar["origin_bytes"] / max(base["origin_bytes"], 1)
+    barc_tx = barc["origin_bytes"] / max(base["origin_bytes"], 1)
     hj_tx = hj["origin_bytes"] / max(base["origin_bytes"], 1)
     f1_corr = 100.0 * (f1["ohr"] - bar["ohr"])
     hj_corr = 100.0 * (hj["ohr"] - bar["ohr"])
+    protocol_cost = 100.0 * (barc["ohr"] - bar["ohr"])       # what the token bucket alone costs
+    hj_vs_barc = 100.0 * (hj["ohr"] - barc["ohr"])           # scheduler vs a LIKE-FOR-LIKE bar
     capture = hj_corr / f1_corr if f1_corr > 0 else float("nan")
 
     d = hj["hits_series"].astype(np.float64) - bar["hits_series"].astype(np.float64)
@@ -283,7 +317,9 @@ def run(trace, cap, pos, szs, haz, args):
     if hz == "oracle":
         print("  ** DIAGNOSTIC ARM -- reads true next-use. Upper bound on what a PERFECT")
         print("  ** forecaster would give this scheduler. NOT a reportable capture result.")
-    print(f"  BAR       OHR {bar['ohr']:.4f} @{bar_tx:.2f}x")
+    print(f"  BAR       OHR {bar['ohr']:.4f} @{bar_tx:.2f}x   (UNLIMITED rate -- may burst)")
+    print(f"  BAR-CAP   OHR {barc['ohr']:.4f} @{barc_tx:.2f}x   (same bar under the schedulers' "
+          f"token bucket)")
     print(f"  HJS-L     OHR {hj['ohr']:.4f} @{hj_tx:.2f}x   pf {hj['pf_issued']:,} "
           f"useful {hj['pf_useful']:,} (prec {hj['pf_precision']:.3f})   spent {sch.spent/max(budget,1):.2f}x budget")
     print(f"  F1 CEIL   OHR {f1['ohr']:.4f}")
@@ -299,6 +335,29 @@ def run(trace, cap, pos, szs, haz, args):
     print(f"\n  HJS-L CORRIDOR   {hj_corr:+.2f} pts   95% CI [{lo:+.2f}, {hi:+.2f}]")
     print(f"  F1 CORRIDOR      {f1_corr:+.2f} pts")
     print(f"  CAPTURE          {capture:.1%} of F1   (corridor CI [{lo:+.2f},{hi:+.2f}])")
+    print(f"\n  PROTOCOL COST    {protocol_cost:+.2f} pts   (bar-capped minus bar: what the token "
+          f"bucket costs BEFORE any scheduling)")
+    print(f"  HJS-L vs BAR-CAP {hj_vs_barc:+.2f} pts   <- the LIKE-FOR-LIKE scheduling result")
+
+    # SECOND AXIS. The gate scores OHR only, so an arm that matches the bar's hit rate on half the
+    # prefetch bytes is recorded as a failure. That is a reporting artifact: on a CDN the bytes ARE
+    # the cost. Report both axes and let the Pareto relation speak.
+    d_ohr = 100.0 * (hj["ohr"] - barc["ohr"])
+    d_pfb = hj["prefetch_bytes"] / max(barc["prefetch_bytes"], 1)
+    if d_ohr >= -0.05 and d_pfb <= 1.0:
+        pv = f"PARETO WIN -- matches/beats OHR on {d_pfb:.2f}x the prefetch bytes"
+    elif d_ohr >= -0.05:
+        pv = "OHR parity, but no byte saving"
+    elif d_pfb < 1.0:
+        pv = f"traffic saved ({d_pfb:.2f}x bytes) at a cost of {abs(d_ohr):.2f} OHR pts -- a trade"
+    else:
+        pv = "DOMINATED -- worse OHR and no byte saving"
+    print(f"  TWO-AXIS         dOHR {d_ohr:+.2f} pts | prefetch bytes {d_pfb:.2f}x vs BAR-CAP")
+    print(f"                   {pv}")
+    if protocol_cost < -2.0:
+        print("    -> the rate cap alone explains most of the deficit. The bar bursts and the "
+              "schedulers cannot;")
+        print("       report HJS-L against BAR-CAP, not against the unlimited bar.")
 
     inv = []
     if hj["pf_cold_hits"] != 0:
@@ -325,7 +384,7 @@ def selftest():
     class A:
         trace = "SYNTH"; limit = 60000; cache_frac = 0.01; pred = "markov1"; tau = 0.05; k = 1
         window = 16; train_frac = 0.5; haz_frac = 0.75; horizon = 5000
-        out = "/tmp/_hjsl_haz.npz"; gamma = 0.10; floor = 0.30
+        out = "/tmp/_hjsl_haz.npz"; gamma = 0.10; floor = 0.30; budget_mode = "rate"
         max_wait = 20000; defer = "hazard"; survival = "km"; hazard = "model"
         blocks = 100; resamples = 500; seed = 0
     a = A()
@@ -359,6 +418,11 @@ def main():
                     help="none = fetch at emission (isolates the deferral lever; should ~= bar)")
     ap.add_argument("--survival", choices=("km", "none"), default="km",
                     help="none = assume S(delta)=1 (isolates the eviction-survival lever)")
+    ap.add_argument("--budget-mode", choices=("rate", "total"), default="rate",
+                    help="rate = token bucket at the bar's average byte rate (the iso-BW convention "
+                         "the F1/v3 ceilings were measured under). total = cumulative byte cap only, "
+                         "no rate limit -- the SAME freedom the unlimited bar has, and the "
+                         "like-for-like scheduling comparison.")
     ap.add_argument("--hazard", choices=("model", "oracle", "point"), default="model",
                     help="model = the learned forecaster (the real policy); oracle = true lag "
                          "(DIAGNOSTIC upper bound -- isolates forecaster quality from scheduler "
