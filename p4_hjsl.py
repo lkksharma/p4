@@ -49,7 +49,7 @@ class HJSL:
     name = "hjsl"
 
     def __init__(self, base, pos, szs, rate, haz, budget,
-                 gamma=0.75, lead_safety=1, floor=0.05, max_wait=200000,
+                 gamma=0.10, lead_safety=1, floor=0.30, max_wait=200000,
                  defer=True, survive=True, hazard="model"):
         self.base, self.pos, self.szs, self.rate = base, pos, szs, rate
         self.budget, self.gamma = budget, gamma
@@ -83,11 +83,18 @@ class HJSL:
         self.freq = {}             # obj -> request count so far (for causal frequency)
         self.tokens = 0.0
         self.spent = 0.0
+        # ISSUE AUTOPSY (diagnostic only -- reads oracle_next AFTER the decision is made, never
+        # feeds it). Separates the two ways a fetch is wasted, which demand opposite fixes:
+        #   late    : the object WAS used, but the use had already passed when we issued
+        #             -> deferral overshoot; lower --gamma.
+        #   nevers  : the object is never used inside the horizon -> filtering failure; raise --floor.
+        self.late = self.on_time = self.nevers = 0
 
     def reset(self):
         self.pending, self.heap, self.ready = {}, [], {}
         self.last_seen, self.freq = {}, {}
         self.tokens = self.spent = 0.0
+        self.late = self.on_time = self.nevers = 0
         r = getattr(self.base, "reset", None)
         if r:
             r()
@@ -207,7 +214,14 @@ class HJSL:
             if self.tokens < s or self.spent + s > self.budget:
                 continue
             self.tokens -= s; self.spent += s
-            self.ready.pop(x, None)
+            t0 = self.ready.pop(x, (0, 0, 0, 0, i, -1))[4]
+            nx0 = oracle_next(self.pos, x, t0)             # DIAGNOSTIC ONLY -- post-decision
+            if nx0 >= int(NEVER):
+                self.nevers += 1
+            elif nx0 < i:
+                self.late += 1                             # the use already happened: overshoot
+            else:
+                self.on_time += 1
             out.append(x)
         out.sort(key=lambda x: self.szs.get(x, 0))                 # smallest-first (HOL safety)
         return out
@@ -263,6 +277,15 @@ def run(trace, cap, pos, szs, haz, args):
     print(f"  HJS-L     OHR {hj['ohr']:.4f} @{hj_tx:.2f}x   pf {hj['pf_issued']:,} "
           f"useful {hj['pf_useful']:,} (prec {hj['pf_precision']:.3f})   spent {sch.spent/max(budget,1):.2f}x budget")
     print(f"  F1 CEIL   OHR {f1['ohr']:.4f}")
+    tot_iss = max(sch.late + sch.on_time + sch.nevers, 1)
+    print(f"  ISSUE AUTOPSY   on-time {sch.on_time:,} ({sch.on_time/tot_iss:.1%})   "
+          f"LATE {sch.late:,} ({sch.late/tot_iss:.1%})   never-used {sch.nevers:,} "
+          f"({sch.nevers/tot_iss:.1%})")
+    if sch.late / tot_iss > 0.25:
+        print("    -> deferral OVERSHOOT dominates: the wake time lands after the use. Lower --gamma.")
+    if sch.nevers / tot_iss > 0.50:
+        print("    -> FILTERING failure dominates: funding candidates that are never used. "
+              "Raise --floor.")
     print(f"\n  HJS-L CORRIDOR   {hj_corr:+.2f} pts   95% CI [{lo:+.2f}, {hi:+.2f}]")
     print(f"  F1 CORRIDOR      {f1_corr:+.2f} pts")
     print(f"  CAPTURE          {capture:.1%} of F1   (corridor CI [{lo:+.2f},{hi:+.2f}])")
@@ -292,7 +315,7 @@ def selftest():
     class A:
         trace = "SYNTH"; limit = 60000; cache_frac = 0.01; pred = "markov1"; tau = 0.05; k = 1
         window = 16; train_frac = 0.5; haz_frac = 0.75; horizon = 5000
-        out = "/tmp/_hjsl_haz.npz"; gamma = 0.75; floor = 0.05
+        out = "/tmp/_hjsl_haz.npz"; gamma = 0.10; floor = 0.30
         max_wait = 20000; defer = "hazard"; survival = "km"; hazard = "model"
         blocks = 100; resamples = 500; seed = 0
     a = A()
@@ -314,8 +337,13 @@ def main():
     ap.add_argument("--window", type=int, default=16)
     ap.add_argument("--train-frac", type=float, default=0.5)
     ap.add_argument("--haz", help="hazard+survival .npz from p4_hazard.py")
-    ap.add_argument("--gamma", type=float, default=0.75, help="use-lag quantile for the wake time")
-    ap.add_argument("--floor", type=float, default=0.05, help="drop candidates with P(future use) below this")
+    ap.add_argument("--gamma", type=float, default=0.10,
+                    help="use-lag quantile targeted by the wake time. LOW = fetch EARLY and catch "
+                         "most uses; HIGH = fetch late and miss them. Only worth raising if the "
+                         "survival curve shows eviction-before-use actually bites (S(100) << 1).")
+    ap.add_argument("--floor", type=float, default=0.30,
+                    help="drop candidates with P(used within horizon) below this. THE precision "
+                         "lever: with a ~70%% never-rate a floor below ~0.3 filters nothing.")
     ap.add_argument("--max-wait", type=int, default=200000)
     ap.add_argument("--defer", choices=("hazard", "none"), default="hazard",
                     help="none = fetch at emission (isolates the deferral lever; should ~= bar)")
