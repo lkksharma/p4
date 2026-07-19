@@ -92,10 +92,10 @@ class WideMarket:
     def _value(self, x, conf, i):
         if self.forecaster == "oracle":                       # DIAGNOSTIC: reads the future
             nx = oracle_next(self.pos, x, i)
-            if nx >= i + self.horizon:
-                return 0.0
-            return 1.0 / (1.0 + (nx - i))                     # prioritise SOONEST uses (survive, low
-                                                              # occupancy) -- mirrors F5's selection
+            if nx < 0 or nx >= i + self.horizon:              # fund only uses within the horizon: a
+                return 0.0                                    # perfect forecaster would NOT fund a use
+            return 1.0 / (1.0 + (nx - i))                     # so distant the object is evicted first.
+                                                              # Prioritise SOONEST -- mirrors F5.
         if self.forecaster == "blend":                        # recall-first: boost popular repeaters
             return float(conf * (1.0 + np.log1p(self.freq.get(x, 0))))
         return float(conf)                                    # markov: raw emission confidence
@@ -160,13 +160,12 @@ class WideMarket:
         # version crawl once the budget was spent and the pool grew without bound. `ranked` is already
         # sorted, so this is one O(pool) walk, no second sort.
         if len(self.pool) > self.maxpool:
-            kept = {}
-            for x, info in ranked:
-                if x in self.pool:
-                    kept[x] = info
-                    if len(kept) >= self.maxpool:
-                        break
-            self.pool = kept
+            # keep the highest-VALUE candidates (info[1]=v), NOT the highest value/size. Capping by
+            # value/size systematically evicts large useful objects (they always rank last per byte),
+            # biasing the pool toward tiny speculative candidates and flooding the cache -- the exact
+            # pathology the --max-pool 512 run exposed (4.5M prefetches, prec 0.10).
+            self.pool = dict(sorted(self.pool.items(), key=lambda kv: kv[1][1], reverse=True)
+                             [:self.maxpool])
 
         out.sort(key=lambda x: self.szs.get(x, 0))            # smallest-first: head-of-line safety
         return out
@@ -295,7 +294,11 @@ def main():
     ap.add_argument("--forecasters", default="markov,blend,oracle",
                     help="comma list of causal value functions to run: markov (default), blend "
                          "(Policy 2 v0, recall-first), oracle (DIAGNOSTIC ceiling, not reportable)")
-    ap.add_argument("--horizon", type=int, default=100_000, help="[oracle] use-within-horizon label")
+    ap.add_argument("--horizon", type=int, default=2000,
+                    help="[oracle] the oracle CEILING tightness: fund only candidates used within this "
+                         "many requests. A perfect forecaster would NOT fund a use so distant the "
+                         "object is evicted before it arrives; 100k over-funds and makes the ceiling "
+                         "look worse than the market can actually do. Keep near the survival scale.")
     ap.add_argument("--floor", type=float, default=0.0, help="drop candidates with value <= floor")
     ap.add_argument("--max-wait", type=int, default=200_000)
     ap.add_argument("--max-pool", type=int, default=4096,
