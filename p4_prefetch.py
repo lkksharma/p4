@@ -216,7 +216,8 @@ class PFCache:
         self.positions, self.sizes = positions, sizes
         self.pf_rate = pf_byte_rate
 
-    def run(self, trace, warmup_frac=0.05, cold_train_frac=None, return_hits=False) -> dict:
+    def run(self, trace, warmup_frac=0.05, cold_train_frac=None, return_hits=False,
+            record_survival=False) -> dict:
         reset = getattr(self.pf, "reset", None)
         if reset:
             reset()                          # stateful prefetchers (Markov-2) must not carry
@@ -266,6 +267,11 @@ class PFCache:
         # If correct-but-evicted ~ 0, the corridor is prefetcher quality and the joint framing dies.
         pf_w_correct = pf_w_mispred = 0
         early_dist = []
+        # SURVIVAL LOG (optional, for HJS-L's S(delta) curve): for each prefetched object, record
+        # (delta requests it stayed in cache, was_it_used) at the moment it leaves -- by use or by
+        # eviction. Additive and off by default; the eviction/hit dynamics are unchanged.
+        pf_admit_t = {} if record_survival else None
+        survival_log = [] if record_survival else None
 
         def _evict_one(t):
             nonlocal used, pf_wasted, pf_w_correct, pf_w_mispred
@@ -280,6 +286,8 @@ class PFCache:
                     pf_w_correct += 1; early_dist.append(nx - t)
                 else:
                     pf_w_mispred += 1
+                if record_survival:
+                    survival_log.append((t - pf_admit_t.pop(vo, t), 0))
             return True
 
         def _admit(o, s, t, is_pf):
@@ -296,6 +304,8 @@ class PFCache:
             if is_pf:
                 pf_pending.add(o)
                 pf_cold[o] = cold_vocab is not None and o not in cold_vocab
+                if record_survival:
+                    pf_admit_t[o] = t
             return True
 
         for i in range(n):
@@ -312,6 +322,8 @@ class PFCache:
                     pf_pending.discard(o); pf_useful += 1
                     if pf_cold.pop(o, False) and counted:
                         pf_cold_hits += 1
+                    if record_survival:
+                        survival_log.append((i - pf_admit_t.pop(o, i), 1))
                 if oracle:
                     ev.touch(o, i)                            # refresh next-access key
                 else:
@@ -352,6 +364,7 @@ class PFCache:
                     # autopsy: why did the wasted prefetches fail?
                     pf_w_correct=pf_w_correct, pf_w_mispred=pf_w_mispred,
                     pf_cold_hits=pf_cold_hits, hits_series=hits_series,
+                    pf_survival=survival_log,
                     pf_w_correct_med_dist=int(np.median(early_dist)) if early_dist else 0)
 
 
