@@ -42,6 +42,7 @@ bootstrap CI excluding zero, on every trace whose F5 cleared.
 from __future__ import annotations
 
 import argparse
+import time
 
 import numpy as np
 
@@ -69,12 +70,13 @@ class WideMarket:
 
     def __init__(self, base, pos, szs, cap, rate, budget, forecaster="markov",
                  horizon=100_000, floor=0.0, max_wait=200_000, budget_mode="rate",
-                 maxpool=4096, verbose=False, vstep=200_000):
+                 maxpool=4096, verbose=False, vstep=200_000, n=0):
         self.base, self.pos, self.szs, self.cap = base, pos, szs, cap
         self.rate, self.budget = rate, budget
         self.forecaster, self.horizon = forecaster, horizon
         self.floor, self.max_wait, self.budget_mode = floor, max_wait, budget_mode
-        self.maxpool, self.verbose, self.vstep = maxpool, verbose, vstep
+        self.maxpool, self.verbose, self.vstep, self.n = maxpool, verbose, vstep, n
+        self.t_start = None
         self.tokens = self.spent = 0.0
         self.last_seen: dict = {}                 # obj -> last request index (causal recency)
         self.freq: dict = {}                      # obj -> count so far (causal frequency)
@@ -85,6 +87,7 @@ class WideMarket:
         self.tokens = self.spent = 0.0
         self.last_seen, self.freq, self.pool = {}, {}, {}
         self.issued = 0
+        self.t_start = time.time()
         r = getattr(self.base, "reset", None)
         if r:
             r()
@@ -106,8 +109,12 @@ class WideMarket:
 
         if self.verbose and i and i % self.vstep == 0:
             import sys
-            print(f"    [{self.forecaster:6s}] {i:>9,} reqs | pool {len(self.pool):>7,} | "
-                  f"issued {self.issued:>8,} | spent {self.spent/max(self.budget,1):.2f}x",
+            el = time.time() - (self.t_start or time.time())
+            rt = i / el if el > 0 else 0.0
+            eta = (self.n - i) / rt / 60.0 if rt > 0 else 0.0
+            print(f"    [{self.forecaster:6s}] {i:>9,}/{self.n:,} ({i/max(self.n,1):4.0%}) | "
+                  f"pool {len(self.pool):>5,} | issued {self.issued:>8,} | "
+                  f"spent {self.spent/max(self.budget,1):.2f}x | {rt:>5.0f} req/s | ETA {eta:4.0f}m",
                   file=sys.stderr, flush=True)
 
         # (1) harvest WIDE candidates, value each causally, add to the pool
@@ -138,8 +145,16 @@ class WideMarket:
         if not self.pool:
             return []
 
-        # (3) fund highest value-per-byte first, within tokens AND the hard total cap
-        ranked = sorted(self.pool.items(), key=lambda kv: kv[1][1] / kv[1][0], reverse=True)
+        # (3) fund first, within tokens AND the hard total cap.
+        # The oracle DIAGNOSTIC ranks by imminence alone (soonest-first) -- F5's exact selection rule
+        # -- so oracle-vs-F5 isolates JIT-vs-at-emission, and oracle-vs-markov isolates forecaster
+        # quality under a FIXED selection rule. markov/blend rank by value-per-byte (byte-billing).
+        # Without this the oracle shares the value/size dispatch confound and can't tell "the design
+        # is the limit" from "the dispatch rule is bad".
+        if self.forecaster == "oracle":
+            ranked = sorted(self.pool.items(), key=lambda kv: kv[1][1], reverse=True)
+        else:
+            ranked = sorted(self.pool.items(), key=lambda kv: kv[1][1] / kv[1][0], reverse=True)
         out = []
         for x, (s, v, fi) in ranked:
             if self.spent + s > self.budget:
@@ -192,18 +207,29 @@ def run(trace, cap, pos, szs, args):
     budget = bar["prefetch_bytes"]
     bar_tx = bar["origin_bytes"] / max(base["origin_bytes"], 1)
 
+    # BAR-CAP -- the bar under the SAME rate token bucket the market faces. Any gap between BAR and
+    # BAR-CAP is the token-bucket PROTOCOL cost (the bar bursts, the rate-limited market cannot), not
+    # scheduling quality. In total mode the market runs unlimited-rate like the bar, so BAR-CAP
+    # collapses onto BAR and the extra replay is skipped. Report the market against BAR-CAP.
+    barc = bar if args.budget_mode == "total" else PFCache(
+        cap, "s3fifo", mk(), positions=pos, sizes=szs, pf_byte_rate=rate).run(
+        trace, cold_train_frac=tf, return_hits=True)
+    protocol = 100.0 * (barc["ohr"] - bar["ohr"])
+
     # F5 COVERAGE CEILING at the same wide config -- the honest denominator for a wide-emit policy.
     coverable, n_cov = build_coverable(mk_wide(), trace, kw, args.wide_tau)
     f5 = PFCache(cap, "s3fifo", CoverGatedPrescient(trace, coverable, k=max(KS), lookahead=2000),
                  positions=pos, sizes=szs, pf_byte_rate=rate).run(
         trace, cold_train_frac=tf, return_hits=True,
-        progress=("F5-ceiling" if args.verbose else None))
+        progress=("F5-ceiling" if args.tqdm else None))
     f5_corr = 100.0 * (f5["ohr"] - bar["ohr"])
 
     print(f"\n  {args.trace}   [Policy 1: wide market | k_wide={kw} tau={args.wide_tau} "
           f"budget={args.budget_mode}]")
     print(f"  BAR       OHR {bar['ohr']:.4f} @{bar_tx:.2f}x   pf {bar['pf_issued']:,} "
           f"useful {bar['pf_useful']:,} (prec {bar['pf_precision']:.3f})")
+    print(f"  BAR-CAP   OHR {barc['ohr']:.4f}   protocol cost {protocol:+.2f} pts   "
+          f"({'rate bucket vs bar burst' if args.budget_mode == 'rate' else 'total mode: == bar'})")
     print(f"  F5 CEIL   OHR {f5['ohr']:.4f}   corridor {f5_corr:+.2f} pts   (coverage {n_cov/n:.1%}) "
           f"<- the denominator")
     print(f"  {'-'*76}")
@@ -216,12 +242,14 @@ def run(trace, cap, pos, szs, args):
                   file=sys.stderr, flush=True)
         sch = WideMarket(mk_wide(), pos, szs, cap, rate, budget, forecaster=fc,
                          horizon=args.horizon, floor=args.floor, max_wait=args.max_wait,
-                         budget_mode=args.budget_mode, maxpool=args.max_pool, verbose=args.verbose)
+                         budget_mode=args.budget_mode, maxpool=args.max_pool, verbose=args.verbose,
+                         n=n)
         p1 = PFCache(cap, "s3fifo", sch, positions=pos, sizes=szs, pf_byte_rate=None).run(
             trace, cold_train_frac=tf, return_hits=True,
-            progress=(f"P1:{fc}" if args.verbose else None))
+            progress=(f"P1:{fc}" if args.tqdm else None))
         p1_tx = p1["origin_bytes"] / max(base["origin_bytes"], 1)
         p1_corr = 100.0 * (p1["ohr"] - bar["ohr"])
+        p1_vs_barc = 100.0 * (p1["ohr"] - barc["ohr"])        # like-for-like: scheduling only
         cap_f5 = p1_corr / f5_corr if f5_corr > 0 else float("nan")
         pfb = p1["prefetch_bytes"] / max(bar["prefetch_bytes"], 1)
         d = p1["hits_series"].astype(np.float64) - bar["hits_series"].astype(np.float64)
@@ -240,27 +268,33 @@ def run(trace, cap, pos, szs, args):
         print(f"  [{fc:6s}] OHR {p1['ohr']:.4f} @{p1_tx:.2f}x   pf {p1['pf_issued']:,} "
               f"useful {p1['pf_useful']:,} (prec {p1['pf_precision']:.3f})   spent "
               f"{sch.spent/max(budget,1):.2f}x{tag}")
-        print(f"           corridor {p1_corr:+.2f} [{lo:+.2f},{hi:+.2f}]   capture {cap_f5:.1%} of F5 "
-              f"| pf bytes {pfb:.2f}x   [{gate}] inv:{okinv}")
+        print(f"           corridor {p1_corr:+.2f} [{lo:+.2f},{hi:+.2f}] (vs BAR-CAP {p1_vs_barc:+.2f}) "
+              f"  capture {cap_f5:.1%} of F5 | pf bytes {pfb:.2f}x   [{gate}] inv:{okinv}")
         for m in inv:
             print(f"           !! {m}")
         results[fc] = (p1_corr, lo, hi, cap_f5)
 
-    # Policy-2 verdict: is the forecaster the bottleneck?
+    # DIAGNOSIS. Two independent questions, answered by two gaps -- now that the oracle uses F5's
+    # OWN selection rule (soonest-first), each gap is clean:
+    #   oracle capture of F5  ->  can the AT-EMISSION design reach F5 with perfect forecasting +
+    #                             F5's selection? If NO, the design (fetch-at-emission) is the limit
+    #                             and no forecaster (Policy 2) can rescue it -> the DEFER/JIT fork.
+    #   oracle - markov       ->  under a FIXED selection rule, how much does forecaster quality cost?
+    #                             This is Policy 2's true prize.
     if "markov" in results and "oracle" in results:
         gap = results["oracle"][0] - results["markov"][0]
-        line = f"  POLICY-2 PRIZE   market(oracle) - market(markov) = {gap:+.2f} pts"
-        if "blend" in results:
-            closed = results["blend"][0] - results["markov"][0]
-            line += f"   | blend closes {closed:+.2f}"
+        oracle_capF5 = results["oracle"][3]
+        line = f"  DESIGN CEILING   oracle (F5's selection, AT EMISSION) = {oracle_capF5:.0%} of F5"
+        line += f"   |   FORECASTER PRIZE  oracle - markov = {gap:+.2f} pts"
         print(f"  {'-'*76}\n{line}")
-        if gap < 2:
-            print("  -> forecaster is NOT the bottleneck; Policy 2 unnecessary (market ~ its own ceiling).")
-        elif "blend" in results and results["blend"][0] - results["markov"][0] >= 0.5 * gap:
-            print("  -> a CHEAP reweight (blend) recovers most of the prize; ship blend, skip the neural rung.")
+        if oracle_capF5 < 0.25:
+            print("  -> even a perfect forecaster with F5's selection captures <25% of F5 AT EMISSION")
+            print("     -> the AT-EMISSION DESIGN is the ceiling, not the forecaster. Policy 2 cannot")
+            print("        rescue it; the missing ingredient is JIT insertion -> the DEFER-for-wide fork.")
+        elif gap < 2:
+            print("  -> at-emission nears F5 AND forecaster gap is small -> design sound, markov close.")
         else:
-            print("  -> prize is real and cheap reweight stalls -> the learned recall forecaster "
-                  "(Policy 2 neural rung) is JUSTIFIED.")
+            print("  -> at-emission can reach F5 but markov leaves a real gap -> Policy 2 justified.")
     print()
     return results
 
@@ -270,7 +304,7 @@ def selftest():
         trace = "SYNTH"; limit = 60000; cache_frac = 0.01; pred = "markov1"; tau = 0.05; k = 1
         window = 16; train_frac = 0.5; wide_k = 16; wide_tau = 0.0; wide_top_m = 16
         forecasters = ["markov", "blend", "oracle"]; horizon = 5000; floor = 0.0
-        max_wait = 20000; budget_mode = "rate"; max_pool = 4096; verbose = False
+        max_wait = 20000; budget_mode = "rate"; max_pool = 4096; verbose = False; tqdm = False
         blocks = 100; resamples = 500; seed = 0
     a = A()
     trace, cap, pos, szs = prep("SYNTH", a.limit, a.cache_frac)
@@ -307,8 +341,12 @@ def main():
                          "Safe because funding is rate-limited and candidates ranked below the cap are "
                          "displaced by fresher higher-value ones before they could ever be funded.")
     ap.add_argument("--verbose", action="store_true",
-                    help="print per-arm progress to stderr every 200k requests (survives tee "
-                         "buffering via flush). Run with `python -u` for fully live output.")
+                    help="clean newline progress to stderr every 200k requests -- % done, pool, "
+                         "issued, spent, req/s, and ETA. Flush-safe and flicker-free, so it works "
+                         "even with several runs in parallel. USE THIS for parallel runs.")
+    ap.add_argument("--tqdm", action="store_true",
+                    help="live tqdm bar per replay. AVOID with parallel runs -- multiple bars on one "
+                         "terminal flicker and read backwards; --verbose is the parallel-safe option.")
     ap.add_argument("--budget-mode", choices=("rate", "total"), default="rate")
     ap.add_argument("--blocks", type=int, default=1000)
     ap.add_argument("--resamples", type=int, default=10000)
