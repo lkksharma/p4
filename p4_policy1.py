@@ -68,11 +68,13 @@ class WideMarket:
     name = "policy1"
 
     def __init__(self, base, pos, szs, cap, rate, budget, forecaster="markov",
-                 horizon=100_000, floor=0.0, max_wait=200_000, budget_mode="rate"):
+                 horizon=100_000, floor=0.0, max_wait=200_000, budget_mode="rate",
+                 maxpool=4096, verbose=False, vstep=200_000):
         self.base, self.pos, self.szs, self.cap = base, pos, szs, cap
         self.rate, self.budget = rate, budget
         self.forecaster, self.horizon = forecaster, horizon
         self.floor, self.max_wait, self.budget_mode = floor, max_wait, budget_mode
+        self.maxpool, self.verbose, self.vstep = maxpool, verbose, vstep
         self.tokens = self.spent = 0.0
         self.last_seen: dict = {}                 # obj -> last request index (causal recency)
         self.freq: dict = {}                      # obj -> count so far (causal frequency)
@@ -101,6 +103,12 @@ class WideMarket:
     def suggest(self, o, cached, i):
         # bandwidth shadow price = an accruing token bucket at the bar's byte rate
         self.tokens = float("inf") if self.budget_mode == "total" else self.tokens + self.rate
+
+        if self.verbose and i and i % self.vstep == 0:
+            import sys
+            print(f"    [{self.forecaster:6s}] {i:>9,} reqs | pool {len(self.pool):>7,} | "
+                  f"issued {self.issued:>8,} | spent {self.spent/max(self.budget,1):.2f}x",
+                  file=sys.stderr, flush=True)
 
         # (1) harvest WIDE candidates, value each causally, add to the pool
         ctx = capture_ctx(self.base)                          # snapshot BEFORE suggest() mutates it
@@ -143,6 +151,23 @@ class WideMarket:
             self.pool.pop(x, None)
             self.issued += 1
             out.append(x)
+
+        # BOUND THE POOL -- keep only the top `maxpool` unfunded candidates. Funding is rate-limited
+        # to a few per request, and fresh higher-value candidates keep arriving, so anything ranked
+        # below maxpool is never reached before it expires: dropping it changes no funding decision.
+        # It is also what makes the market deployable (no real system holds millions of pending
+        # candidates) AND the fix for the O(pool*log pool)-per-request cost that made the unbounded
+        # version crawl once the budget was spent and the pool grew without bound. `ranked` is already
+        # sorted, so this is one O(pool) walk, no second sort.
+        if len(self.pool) > self.maxpool:
+            kept = {}
+            for x, info in ranked:
+                if x in self.pool:
+                    kept[x] = info
+                    if len(kept) >= self.maxpool:
+                        break
+            self.pool = kept
+
         out.sort(key=lambda x: self.szs.get(x, 0))            # smallest-first: head-of-line safety
         return out
 
@@ -172,7 +197,8 @@ def run(trace, cap, pos, szs, args):
     coverable, n_cov = build_coverable(mk_wide(), trace, kw, args.wide_tau)
     f5 = PFCache(cap, "s3fifo", CoverGatedPrescient(trace, coverable, k=max(KS), lookahead=2000),
                  positions=pos, sizes=szs, pf_byte_rate=rate).run(
-        trace, cold_train_frac=tf, return_hits=True)
+        trace, cold_train_frac=tf, return_hits=True,
+        progress=("F5-ceiling" if args.verbose else None))
     f5_corr = 100.0 * (f5["ohr"] - bar["ohr"])
 
     print(f"\n  {args.trace}   [Policy 1: wide market | k_wide={kw} tau={args.wide_tau} "
@@ -185,11 +211,16 @@ def run(trace, cap, pos, szs, args):
 
     results = {}
     for fc in args.forecasters:
+        if args.verbose:
+            import sys
+            print(f"  >> forecaster arm '{fc}' starting ({trace['n']:,} reqs)...",
+                  file=sys.stderr, flush=True)
         sch = WideMarket(mk_wide(), pos, szs, cap, rate, budget, forecaster=fc,
                          horizon=args.horizon, floor=args.floor, max_wait=args.max_wait,
-                         budget_mode=args.budget_mode)
+                         budget_mode=args.budget_mode, maxpool=args.max_pool, verbose=args.verbose)
         p1 = PFCache(cap, "s3fifo", sch, positions=pos, sizes=szs, pf_byte_rate=None).run(
-            trace, cold_train_frac=tf, return_hits=True)
+            trace, cold_train_frac=tf, return_hits=True,
+            progress=(f"P1:{fc}" if args.verbose else None))
         p1_tx = p1["origin_bytes"] / max(base["origin_bytes"], 1)
         p1_corr = 100.0 * (p1["ohr"] - bar["ohr"])
         cap_f5 = p1_corr / f5_corr if f5_corr > 0 else float("nan")
@@ -240,7 +271,8 @@ def selftest():
         trace = "SYNTH"; limit = 60000; cache_frac = 0.01; pred = "markov1"; tau = 0.05; k = 1
         window = 16; train_frac = 0.5; wide_k = 16; wide_tau = 0.0; wide_top_m = 16
         forecasters = ["markov", "blend", "oracle"]; horizon = 5000; floor = 0.0
-        max_wait = 20000; budget_mode = "rate"; blocks = 100; resamples = 500; seed = 0
+        max_wait = 20000; budget_mode = "rate"; max_pool = 4096; verbose = False
+        blocks = 100; resamples = 500; seed = 0
     a = A()
     trace, cap, pos, szs = prep("SYNTH", a.limit, a.cache_frac)
     run(trace, cap, pos, szs, a)
@@ -266,6 +298,14 @@ def main():
     ap.add_argument("--horizon", type=int, default=100_000, help="[oracle] use-within-horizon label")
     ap.add_argument("--floor", type=float, default=0.0, help="drop candidates with value <= floor")
     ap.add_argument("--max-wait", type=int, default=200_000)
+    ap.add_argument("--max-pool", type=int, default=4096,
+                    help="cap on pending candidates held between requests -- the per-request sort cost "
+                         "scales with this, so it is THE speed knob: drop to 512 for ~8x faster runs. "
+                         "Safe because funding is rate-limited and candidates ranked below the cap are "
+                         "displaced by fresher higher-value ones before they could ever be funded.")
+    ap.add_argument("--verbose", action="store_true",
+                    help="print per-arm progress to stderr every 200k requests (survives tee "
+                         "buffering via flush). Run with `python -u` for fully live output.")
     ap.add_argument("--budget-mode", choices=("rate", "total"), default="rate")
     ap.add_argument("--blocks", type=int, default=1000)
     ap.add_argument("--resamples", type=int, default=10000)

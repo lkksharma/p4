@@ -217,7 +217,7 @@ class PFCache:
         self.pf_rate = pf_byte_rate
 
     def run(self, trace, warmup_frac=0.05, cold_train_frac=None, return_hits=False,
-            record_survival=False) -> dict:
+            record_survival=False, progress=None) -> dict:
         reset = getattr(self.pf, "reset", None)
         if reset:
             reset()                          # stateful prefetchers (Markov-2) must not carry
@@ -308,7 +308,15 @@ class PFCache:
                     pf_admit_t[o] = t
             return True
 
-        for i in range(n):
+        _it = range(n)
+        if progress:                              # live progress + ETA (stderr); no-op if tqdm absent
+            try:
+                from tqdm import tqdm
+                _it = tqdm(_it, desc=str(progress), unit="req", unit_scale=True,
+                           mininterval=0.5, dynamic_ncols=True, leave=False)
+            except Exception:
+                pass
+        for i in _it:
             o, s, nx = int(ids[i]), int(szs[i]), int(nxt[i])
             counted = i >= warm
             if counted:
