@@ -51,7 +51,11 @@ SIZE_EDGES = np.logspace(1.0, 8.0, 8)      # 7 size bins over [10 B, 1e8 B]
 # THE predictor of use-lag; conf+size alone cannot separate lags and make F2 a false-negative.
 REC_EDGES = np.logspace(0.0, 6.0, 17)      # 16 finite recency bins over [1, 1e6]
 REC_COLD = 16                              # object not yet seen in the replay -> "cold" bin
-N_CONF, N_SIZE, N_REC = 7, 7, 17
+# FREQUENCY -- how many times the candidate has been requested so far -- is the second temporal
+# feature the proposal named (§2.1). Added as diligence: a decisive F2 fail WITH recency+frequency
+# both present is a genuine "the when is unlearnable" finding, not an under-featured artifact.
+FREQ_EDGES = np.array([1, 2, 4, 8, 16, 64, 256])       # bin 0 = unseen; 7 freq bins
+N_CONF, N_SIZE, N_REC, N_FREQ = 7, 7, 17, 7
 
 
 def lag_bin(lag: int) -> int:
@@ -76,21 +80,35 @@ def recency_bin(r: int) -> int:
     return min(max(b, 0), 15)
 
 
-def harvest(pred, trace, lo, hi, szs, pos):
-    """(recency, conf, size, lag) for every predictor emission with i in [lo, hi). lag = -1 for
-    'never', recency = -1 for 'not yet seen'. Recency = i - (last request index of the candidate),
-    tracked causally over the whole replay. Replays with an empty cache (state advances correctly;
-    candidate set = the predictor's own top-k), recording only emissions in the window."""
+def freq_bin(f: int) -> int:
+    return min(int(np.searchsorted(FREQ_EDGES, f, side="right")), N_FREQ - 1)
+
+
+def harvest(pred, trace, lo, hi, szs, pos, horizon):
+    """(recency, freq, conf, size, lag) for every predictor emission with i in [lo, hi). lag = -1
+    for 'never', recency = -1 for 'not yet seen'. Recency = i - (last request index of the
+    candidate), tracked causally over the whole replay. Replays with an empty cache (state advances
+    correctly; candidate set = the predictor's own top-k), recording only emissions in the window.
+
+    FIXED OBSERVATION HORIZON. 'never' means "not used within `horizon` requests", NOT "never again
+    in the rest of the trace". The latter is not a well-defined label: an emission at i=1.99M is
+    called 'never' merely because the trace ends, while one at i=0.5M has 1.5M requests in which to
+    be vindicated -- so the label's meaning drifts with position, and the train and eval windows end
+    up measuring different things. A fixed window makes every emission's label identical in meaning,
+    and emissions with fewer than `horizon` requests remaining are DROPPED as unobservable rather
+    than silently mislabelled. It also matches the decision the scheduler actually faces: a use one
+    million requests away is unreachable by prefetching regardless."""
     ids = trace["obj_id"]
+    n = trace["n"]
     empty = frozenset()
     pred.reset()
-    last_seen = {}
-    rec_a, conf_a, size_a, lag_a = [], [], [], []
-    for i in range(trace["n"]):
+    last_seen, freq = {}, {}
+    rec_a, frq_a, conf_a, size_a, lag_a = [], [], [], [], []
+    for i in range(n):
         o = int(ids[i])
         ctx = capture_ctx(pred)                         # BEFORE suggest mutates predictor state
         objs = pred.suggest(o, empty, i)
-        if objs and lo <= i < hi:
+        if objs and lo <= i < hi and i + horizon <= n:  # else: not enough future to observe
             cmap = conf_lookup(pred, ctx, o)
             tau = getattr(pred, "tau", 0.05)
             for x in objs:
@@ -99,27 +117,33 @@ def harvest(pred, trace, lo, hi, szs, pos):
                 if s is None:
                     continue
                 nx = oracle_next(pos, x, i)
+                lag = int(nx) - i if nx < int(NEVER) else -1
+                if lag > horizon:
+                    lag = -1                            # beyond the window == never, by definition
                 rec_a.append(i - last_seen[x] if x in last_seen else -1)
+                frq_a.append(freq.get(x, 0))
                 conf_a.append(cmap.get(x, tau))
                 size_a.append(s)
-                lag_a.append(int(nx) - i if nx < int(NEVER) else -1)
+                lag_a.append(lag)
         last_seen[o] = i                                # causal: o is now seen at i
-    return (np.array(rec_a, dtype=np.int64), np.array(conf_a),
+        freq[o] = freq.get(o, 0) + 1
+    return (np.array(rec_a, dtype=np.int64), np.array(frq_a, dtype=np.int64), np.array(conf_a),
             np.array(size_a, dtype=np.int64), np.array(lag_a, dtype=np.int64))
 
 
-def build_hazard(rec, conf, lag):
-    """p(lag_bin | recency_bin, conf_bin) as a (N_REC, N_CONF, N_LAG) normalised histogram.
+def build_hazard(rec, frq, conf, lag):
+    """p(lag_bin | recency_bin, freq_bin, conf_bin) as (N_REC, N_FREQ, N_CONF, N_LAG), normalised.
     Empty cells fall back to the global lag distribution so the scheduler never divides by zero."""
-    hist = np.zeros((N_REC, N_CONF, N_LAG), dtype=np.float64)
-    for r, c, lg in zip(rec, conf, lag):
-        hist[recency_bin(int(r)), conf_bin(c), lag_bin(int(lg))] += 1.0
-    glob = hist.sum(axis=(0, 1))
+    hist = np.zeros((N_REC, N_FREQ, N_CONF, N_LAG), dtype=np.float64)
+    for r, f, c, lg in zip(rec, frq, conf, lag):
+        hist[recency_bin(int(r)), freq_bin(int(f)), conf_bin(c), lag_bin(int(lg))] += 1.0
+    glob = hist.sum(axis=(0, 1, 2))
     glob = glob / max(glob.sum(), 1.0)
     for a in range(N_REC):
-        for b in range(N_CONF):
-            tot = hist[a, b].sum()
-            hist[a, b] = hist[a, b] / tot if tot > 0 else glob
+        for b in range(N_FREQ):
+            for d in range(N_CONF):
+                tot = hist[a, b, d].sum()
+                hist[a, b, d] = hist[a, b, d] / tot if tot > 0 else glob
     return hist
 
 
@@ -182,22 +206,35 @@ def median_lag_pred(hist_row):
 def run(trace, cap, pos, szs, args):
     tf = args.train_frac
     n = trace["n"]
-    cut = int(n * tf)
+    cut = int(n * tf)                                  # predictor's own training boundary
+    hcut = int(n * args.haz_frac)                      # hazard-train / F2-eval boundary
+    H = args.horizon
 
     def mk():
         return PREDS[args.pred](trace, train_frac=tf, window=args.window, k=args.k, tau=args.tau)
 
-    # ---- hazard model: TRAIN on the prefix only, then F2-evaluate on the held-out half ----
-    r_tr, c_tr, s_tr, l_tr = harvest(mk(), trace, 0, cut, szs, pos)
-    hist = build_hazard(r_tr, c_tr, l_tr)
+    # ---- THREE-WAY SPLIT (this is load-bearing, not hygiene) --------------------------------
+    # [0, cut)     the PREDICTOR trains here
+    # [cut, hcut)  the HAZARD MODEL trains here -- on the predictor's OUT-OF-SAMPLE behaviour
+    # [hcut, n)    F2 evaluates here
+    #
+    # Harvesting hazard-training data from [0, cut) -- the predictor's own training window -- is a
+    # design error that inverts the model. In-sample, a high-confidence table row means "memorised,
+    # and reliably right". Out-of-sample, a high-confidence row is often one built from very few
+    # observations, i.e. overfit and MORE likely wrong. So the confidence->outcome relationship
+    # flips sign between the windows, and a model fit on the first is anti-predictive on the second
+    # (never-AUC lands BELOW 0.5, the signature of exactly this bug rather than of a weak model).
+    # The hazard model must see the predictor as it will actually behave at deployment: unseen data.
+    r_tr, f_tr, c_tr, s_tr, l_tr = harvest(mk(), trace, cut, hcut, szs, pos, H)
+    hist = build_hazard(r_tr, f_tr, c_tr, l_tr)
 
-    r_ev, c_ev, s_ev, l_ev = harvest(mk(), trace, cut, n, szs, pos)
+    r_ev, f_ev, c_ev, s_ev, l_ev = harvest(mk(), trace, hcut, n, szs, pos, H)
     used = l_ev >= 0
-    pred_med = np.array([median_lag_pred(hist[recency_bin(int(r)), conf_bin(c)])
-                         for r, c in zip(r_ev, c_ev)])
+    pred_med = np.array([median_lag_pred(hist[recency_bin(int(r)), freq_bin(int(f)), conf_bin(c)])
+                         for r, f, c in zip(r_ev, f_ev, c_ev)])
     rho = spearman(pred_med[used], l_ev[used].astype(np.float64))
-    p_never = np.array([hist[recency_bin(int(r)), conf_bin(c), NEVER_BIN]
-                        for r, c in zip(r_ev, c_ev)])
+    p_never = np.array([hist[recency_bin(int(r)), freq_bin(int(f)), conf_bin(c), NEVER_BIN]
+                        for r, f, c in zip(r_ev, f_ev, c_ev)])
     never_auc = auc(p_never, (~used).astype(int))
 
     # ---- survival curve S(delta): instrumented bar replay over the full trace ----
@@ -214,9 +251,18 @@ def run(trace, cap, pos, szs, args):
 
     f2_pass = (not np.isnan(rho) and rho >= 0.20) and (not np.isnan(never_auc) and never_auc >= 0.60)
 
+    tr_never = float((l_tr < 0).mean()) if len(l_tr) else float("nan")
+    ev_never = float((~used).mean()) if len(l_ev) else float("nan")
     print(f"\n  {args.trace}   [hazard: {args.pred} tau={args.tau} k={args.k}]")
-    print(f"  train emissions {len(l_tr):,}   eval emissions {len(l_ev):,}   "
-          f"({used.sum():,} used, {(~used).sum():,} never)")
+    print(f"  split  predictor [0,{cut:,})  hazard-train [{cut:,},{hcut:,})  "
+          f"F2-eval [{hcut:,},{n:,})   horizon {H:,}")
+    print(f"  hazard-train emissions {len(l_tr):,} (never {tr_never:.1%})   "
+          f"F2-eval emissions {len(l_ev):,} (never {ev_never:.1%})")
+    # The two never-rates should now be COMPARABLE. A large gap means the windows still see
+    # different regimes and the model is being asked to extrapolate rather than predict.
+    if not (np.isnan(tr_never) or np.isnan(ev_never)) and abs(tr_never - ev_never) > 0.15:
+        print(f"  !! never-rate gap {abs(tr_never-ev_never):.1%} between windows -- the hazard "
+              f"model is extrapolating; treat F2 as unreliable")
     print(f"  survival events {len(d):,}   median lifetime "
           f"{int(np.median(d)) if len(d) else 0:,} req   S(100)={survival_km(d,cen,np.array([100]))[0]:.3f}")
     print(f"\n  F2  Spearman(pred median lag, true lag)  {rho:+.3f}   [gate >= 0.20]")
@@ -227,9 +273,10 @@ def run(trace, cap, pos, szs, args):
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
         np.savez_compressed(
             args.out, hist=hist, lag_edges=LAG_EDGES, conf_edges=CONF_EDGES, size_edges=SIZE_EDGES,
-            rec_edges=REC_EDGES, surv_grid=surv_grid, surv_vals=surv_vals,
+            rec_edges=REC_EDGES, freq_edges=FREQ_EDGES, surv_grid=surv_grid, surv_vals=surv_vals,
             rho=rho, never_auc=never_auc, f2_pass=f2_pass,
-            pred=args.pred, tau=args.tau, k=args.k, train_frac=tf)
+            pred=args.pred, tau=args.tau, k=args.k, train_frac=tf,
+            haz_frac=args.haz_frac, horizon=H)
         print(f"  saved -> {args.out}")
     print()
     return f2_pass
@@ -240,6 +287,7 @@ def selftest():
     class A:
         trace = "SYNTH"; limit = 60000; cache_frac = 0.01
         pred = "markov1"; tau = 0.05; k = 1; window = 16; train_frac = 0.5; out = None
+        haz_frac = 0.75; horizon = 5000
     trace, cap, pos, szs = prep("SYNTH", A.limit, A.cache_frac)
     run(trace, cap, pos, szs, A())
     print("  [p4_hazard selftest] completed without error\n")
@@ -254,7 +302,15 @@ def main():
     ap.add_argument("--tau", type=float)
     ap.add_argument("--k", type=int)
     ap.add_argument("--window", type=int, default=16)
-    ap.add_argument("--train-frac", type=float, default=0.5)
+    ap.add_argument("--train-frac", type=float, default=0.5,
+                    help="predictor training fraction -- must match the bar config")
+    ap.add_argument("--haz-frac", type=float, default=0.75,
+                    help="hazard model trains on [train_frac, haz_frac); F2 evaluates on "
+                         "[haz_frac, 1.0). MUST exceed --train-frac or the hazard model is fit on "
+                         "the predictor's own training data and inverts (never-AUC < 0.5).")
+    ap.add_argument("--horizon", type=int, default=100_000,
+                    help="observation window: 'never' means not used within this many requests. "
+                         "Emissions with less remaining trace are dropped as unobservable.")
     ap.add_argument("--out", default=None, help="save the hazard+survival model to this .npz")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
@@ -262,6 +318,9 @@ def main():
         selftest(); return
     if not (args.trace and args.pred and args.tau is not None and args.k is not None):
         ap.error("need --trace --pred --tau --k (or --selftest)")
+    if args.haz_frac <= args.train_frac:
+        ap.error(f"--haz-frac ({args.haz_frac}) must exceed --train-frac ({args.train_frac}): the "
+                 "hazard model must be fit on the predictor's OUT-OF-SAMPLE behaviour")
     trace, cap, pos, szs = prep(args.trace, args.limit, args.cache_frac)
     run(trace, cap, pos, szs, args)
 

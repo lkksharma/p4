@@ -37,8 +37,10 @@ import numpy as np
 from p4_coldsplit import PREDS
 from p4_f1 import emit_vocab
 from p4_f4 import capture_ctx, conf_lookup
-from p4_hazard import LAG_EDGES, NEVER_BIN, N_CONF, N_REC, conf_bin, recency_bin, run as haz_run
-from p4_prefetch import PFCache, Prescient
+from p4_hazard import (LAG_EDGES, NEVER_BIN, N_CONF, N_FREQ, N_REC, conf_bin, freq_bin,
+                       recency_bin, run as haz_run)
+from p4_cache import NEVER
+from p4_prefetch import PFCache, Prescient, oracle_next
 from p4_sweep import KS, prep
 
 
@@ -48,30 +50,43 @@ class HJSL:
 
     def __init__(self, base, pos, szs, rate, haz, budget,
                  gamma=0.75, lead_safety=1, floor=0.05, max_wait=200000,
-                 defer=True, survive=True):
+                 defer=True, survive=True, hazard="model"):
         self.base, self.pos, self.szs, self.rate = base, pos, szs, rate
         self.budget, self.gamma = budget, gamma
         self.lead_safety, self.floor, self.max_wait = lead_safety, floor, max_wait
         self.defer, self.survive = defer, survive
+        # hazard = model  : the learned p(lag | recency, freq, conf)          [the real policy]
+        #          oracle : the TRUE lag, a point mass                        [DIAGNOSTIC ONLY]
+        #          point  : the learned distribution collapsed to its median  [does the shape matter?]
+        # `oracle` is the arm that separates the two ways HJS-L can fail: if oracle-hazard captures
+        # a lot and model-hazard captures little, the bottleneck is the FORECASTER (F2), not the
+        # scheduler design -- and the paper reports "the when is hard to learn", not "scheduling
+        # does not work". Never report `oracle` as a result; it reads the future.
+        self.hazard = hazard
 
         self.hist = haz["hist"]                                    # (7,7,17) p(lag|conf,size)
         self.mids = np.sqrt(LAG_EDGES[:-1] * LAG_EDGES[1:])        # (16,) geometric bin midpoints
         self.sg, self.sv = haz["surv_grid"], haz["surv_vals"]      # S(delta) step function
-        # wake offset per (recency_bin,conf_bin): the gamma-quantile lag (fixed gamma -> precompute)
-        self.woff = np.zeros((N_REC, N_CONF))
+        # wake offset per (recency,freq,conf) bin: the gamma-quantile lag (fixed gamma -> precompute)
+        self.woff = np.zeros((N_REC, N_FREQ, N_CONF))
+        self.wmed = np.zeros((N_REC, N_FREQ, N_CONF))          # median, for the `point` ablation
         for a in range(N_REC):
-            for b in range(N_CONF):
-                self.woff[a, b] = self._quantile(self.hist[a, b], gamma)
+            for b in range(N_FREQ):
+                for d in range(N_CONF):
+                    self.woff[a, b, d] = self._quantile(self.hist[a, b, d], gamma)
+                    self.wmed[a, b, d] = self._quantile(self.hist[a, b, d], 0.5)
 
-        self.pending = {}          # obj -> (size, rec_bin, conf_bin, t0, wake)
+        self.pending = {}          # obj -> (size, rec_bin, freq_bin, conf_bin, t0, wake)
         self.heap = []             # (wake, obj) lazy-deleted
-        self.ready = {}            # obj -> (size, rec_bin, conf_bin, t0)
+        self.ready = {}            # obj -> (size, rec_bin, freq_bin, conf_bin, t0)
         self.last_seen = {}        # obj -> last request index (for causal recency)
+        self.freq = {}             # obj -> request count so far (for causal frequency)
         self.tokens = 0.0
         self.spent = 0.0
 
     def reset(self):
-        self.pending, self.heap, self.ready, self.last_seen = {}, [], {}, {}
+        self.pending, self.heap, self.ready = {}, [], {}
+        self.last_seen, self.freq = {}, {}
         self.tokens = self.spent = 0.0
         r = getattr(self.base, "reset", None)
         if r:
@@ -90,13 +105,28 @@ class HJSL:
         idx = np.searchsorted(self.sg, deltas, side="right") - 1
         return np.where(idx >= 0, self.sv[np.clip(idx, 0, len(self.sv) - 1)], 1.0)
 
-    def _utility(self, rb, cb, elapsed):
+    def _utility(self, rb, fb, cb, elapsed, tl):
         """(U, p_future): expected hit credit of fetching NOW, and P(use still to come)."""
-        row = self.hist[rb, cb]
+        if self.hazard == "oracle":                            # DIAGNOSTIC: true lag, point mass
+            if tl < 0 or tl <= elapsed:
+                return 0.0, 0.0
+            S = float(self._S(np.array([tl - elapsed]))[0]) if self.survive else 1.0
+            return S, 1.0
+
+        row = self.hist[rb, fb, cb]
+        never = row[NEVER_BIN]
+        if self.hazard == "point":                             # median only, no distribution shape
+            fin = row[:16].sum()
+            p_future = fin / (fin + never) if (fin + never) > 0 else 0.0
+            m = self.wmed[rb, fb, cb]
+            if m <= elapsed:
+                return 0.0, p_future
+            S = float(self._S(np.array([m - elapsed]))[0]) if self.survive else 1.0
+            return float(p_future * S), p_future
+
         mask = self.mids > elapsed
         resid = row[:16][mask]
         rs = resid.sum()
-        never = row[NEVER_BIN]
         p_future = rs / (rs + never) if (rs + never) > 0 else 0.0
         if rs <= 0:
             return 0.0, p_future
@@ -121,14 +151,25 @@ class HJSL:
                     continue
                 cb = conf_bin(cmap.get(x, tau))
                 rb = recency_bin(i - self.last_seen[x] if x in self.last_seen else -1)
+                fb = freq_bin(self.freq.get(x, 0))
+                tl = -1
+                if self.hazard == "oracle":                        # DIAGNOSTIC arm only
+                    nx = oracle_next(self.pos, x, i)
+                    if nx >= int(NEVER):
+                        continue                                   # never used -> never fund it
+                    tl = int(nx) - i
                 if self.defer:
                     lead = s / max(self.rate, 1.0) + self.lead_safety
-                    wake = max(int(i + self.woff[rb, cb] - lead), i)
+                    off = (tl if self.hazard == "oracle" else
+                           self.wmed[rb, fb, cb] if self.hazard == "point" else
+                           self.woff[rb, fb, cb])
+                    wake = max(int(i + off - lead), i)
                 else:
                     wake = i                                       # ablation: fetch at emission
-                self.pending[x] = (s, rb, cb, i, wake)
+                self.pending[x] = (s, rb, fb, cb, i, wake, tl)
                 heapq.heappush(self.heap, (wake, x))
         self.last_seen[o] = i                                      # causal recency: o seen at i
+        self.freq[o] = self.freq.get(o, 0) + 1                     # causal frequency
 
         # (2) move due candidates into the ready set
         while self.heap and self.heap[0][0] <= i:
@@ -136,21 +177,21 @@ class HJSL:
             info = self.pending.pop(x, None)
             if info is None:
                 continue                                           # stale (already handled)
-            s, rb, cb, t0, _ = info
-            self.ready[x] = (s, rb, cb, t0)
+            s, rb, fb, cb, t0, _, tl = info
+            self.ready[x] = (s, rb, fb, cb, t0, tl)
 
         if not self.ready or self.tokens < min(v[0] for v in self.ready.values()):
             return []
 
         # (3) score ready candidates; expire the hopeless ones
         scored, drop = [], []
-        for x, (s, rb, cb, t0) in self.ready.items():
+        for x, (s, rb, fb, cb, t0, tl) in self.ready.items():
             if x in cached:                                        # demand-filled -> cancel
                 drop.append(x); continue
             elapsed = i - t0
             if elapsed > self.max_wait:
                 drop.append(x); continue
-            U, p_future = self._utility(rb, cb, elapsed)
+            U, p_future = self._utility(rb, fb, cb, elapsed, tl)
             if p_future < self.floor or U <= 0:
                 drop.append(x); continue
             scored.append((U / s, x, s))
@@ -199,7 +240,7 @@ def run(trace, cap, pos, szs, haz, args):
 
     sch = HJSL(mk(), pos, szs, rate, haz, budget, gamma=args.gamma, floor=args.floor,
                max_wait=args.max_wait, defer=(args.defer != "none"),
-               survive=(args.survival != "none"))
+               survive=(args.survival != "none"), hazard=getattr(args, "hazard", "model"))
     hj = PFCache(cap, "s3fifo", sch, positions=pos, sizes=szs, pf_byte_rate=rate).run(
         trace, cold_train_frac=tf, return_hits=True)
 
@@ -212,7 +253,12 @@ def run(trace, cap, pos, szs, haz, args):
     d = hj["hits_series"].astype(np.float64) - bar["hits_series"].astype(np.float64)
     lo, hi = block_ci(d, args.blocks, args.resamples, args.seed)
 
-    print(f"\n  {args.trace}   [gamma={args.gamma} defer={args.defer} survival={args.survival}]")
+    hz = getattr(args, "hazard", "model")
+    print(f"\n  {args.trace}   [hazard={hz} gamma={args.gamma} defer={args.defer} "
+          f"survival={args.survival}]")
+    if hz == "oracle":
+        print("  ** DIAGNOSTIC ARM -- reads true next-use. Upper bound on what a PERFECT")
+        print("  ** forecaster would give this scheduler. NOT a reportable capture result.")
     print(f"  BAR       OHR {bar['ohr']:.4f} @{bar_tx:.2f}x")
     print(f"  HJS-L     OHR {hj['ohr']:.4f} @{hj_tx:.2f}x   pf {hj['pf_issued']:,} "
           f"useful {hj['pf_useful']:,} (prec {hj['pf_precision']:.3f})   spent {sch.spent/max(budget,1):.2f}x budget")
@@ -245,8 +291,10 @@ def run(trace, cap, pos, szs, haz, args):
 def selftest():
     class A:
         trace = "SYNTH"; limit = 60000; cache_frac = 0.01; pred = "markov1"; tau = 0.05; k = 1
-        window = 16; train_frac = 0.5; out = "/tmp/_hjsl_haz.npz"; gamma = 0.75; floor = 0.05
-        max_wait = 20000; defer = "hazard"; survival = "km"; blocks = 100; resamples = 500; seed = 0
+        window = 16; train_frac = 0.5; haz_frac = 0.75; horizon = 5000
+        out = "/tmp/_hjsl_haz.npz"; gamma = 0.75; floor = 0.05
+        max_wait = 20000; defer = "hazard"; survival = "km"; hazard = "model"
+        blocks = 100; resamples = 500; seed = 0
     a = A()
     trace, cap, pos, szs = prep("SYNTH", a.limit, a.cache_frac)
     haz_run(trace, cap, pos, szs, a)                    # writes /tmp/_hjsl_haz.npz
@@ -273,6 +321,11 @@ def main():
                     help="none = fetch at emission (isolates the deferral lever; should ~= bar)")
     ap.add_argument("--survival", choices=("km", "none"), default="km",
                     help="none = assume S(delta)=1 (isolates the eviction-survival lever)")
+    ap.add_argument("--hazard", choices=("model", "oracle", "point"), default="model",
+                    help="model = the learned forecaster (the real policy); oracle = true lag "
+                         "(DIAGNOSTIC upper bound -- isolates forecaster quality from scheduler "
+                         "design, never reportable); point = learned median only (does the "
+                         "distribution shape earn its keep?)")
     ap.add_argument("--blocks", type=int, default=1000)
     ap.add_argument("--resamples", type=int, default=10000)
     ap.add_argument("--seed", type=int, default=0)
