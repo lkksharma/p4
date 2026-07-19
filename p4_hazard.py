@@ -46,7 +46,12 @@ NEVER_BIN = 16
 N_LAG = 17
 CONF_EDGES = np.array([0.0, 0.05, 0.10, 0.20, 0.35, 0.50, 0.75, 1.01])   # 7 conf bins
 SIZE_EDGES = np.logspace(1.0, 8.0, 8)      # 7 size bins over [10 B, 1e8 B]
-N_CONF, N_SIZE = 7, 7
+# RECENCY -- time since the candidate object was last requested -- is the primary temporal
+# feature: temporal locality means a recently-seen object tends to be seen again soon. This is
+# THE predictor of use-lag; conf+size alone cannot separate lags and make F2 a false-negative.
+REC_EDGES = np.logspace(0.0, 6.0, 17)      # 16 finite recency bins over [1, 1e6]
+REC_COLD = 16                              # object not yet seen in the replay -> "cold" bin
+N_CONF, N_SIZE, N_REC = 7, 7, 17
 
 
 def lag_bin(lag: int) -> int:
@@ -64,46 +69,55 @@ def size_bin(s: int) -> int:
     return min(max(int(np.searchsorted(SIZE_EDGES, s, side="right")) - 1, 0), N_SIZE - 1)
 
 
-def harvest(pred, trace, lo, hi, szs, pos):
-    """(conf, size, lag) for every predictor emission with i in [lo, hi). lag = -1 for 'never'.
+def recency_bin(r: int) -> int:
+    if r < 0:
+        return REC_COLD                    # never seen yet in the replay
+    b = int(np.searchsorted(REC_EDGES, r, side="right")) - 1
+    return min(max(b, 0), 15)
 
-    Replays the predictor over the WHOLE trace with an empty cache (so state advances correctly and
-    the candidate set is the predictor's own top-k), recording only emissions in the window. Same
-    convention as p4_f1.emit_vocab, so the hazard model sees exactly the candidates HJS-L will."""
+
+def harvest(pred, trace, lo, hi, szs, pos):
+    """(recency, conf, size, lag) for every predictor emission with i in [lo, hi). lag = -1 for
+    'never', recency = -1 for 'not yet seen'. Recency = i - (last request index of the candidate),
+    tracked causally over the whole replay. Replays with an empty cache (state advances correctly;
+    candidate set = the predictor's own top-k), recording only emissions in the window."""
     ids = trace["obj_id"]
     empty = frozenset()
     pred.reset()
-    conf_a, size_a, lag_a = [], [], []
+    last_seen = {}
+    rec_a, conf_a, size_a, lag_a = [], [], [], []
     for i in range(trace["n"]):
         o = int(ids[i])
         ctx = capture_ctx(pred)                         # BEFORE suggest mutates predictor state
         objs = pred.suggest(o, empty, i)
-        if not objs or not (lo <= i < hi):
-            continue
-        cmap = conf_lookup(pred, ctx, o)
-        tau = getattr(pred, "tau", 0.05)
-        for x in objs:
-            x = int(x)
-            s = szs.get(x)
-            if s is None:
-                continue
-            nx = oracle_next(pos, x, i)
-            conf_a.append(cmap.get(x, tau))
-            size_a.append(s)
-            lag_a.append(int(nx) - i if nx < int(NEVER) else -1)
-    return np.array(conf_a), np.array(size_a, dtype=np.int64), np.array(lag_a, dtype=np.int64)
+        if objs and lo <= i < hi:
+            cmap = conf_lookup(pred, ctx, o)
+            tau = getattr(pred, "tau", 0.05)
+            for x in objs:
+                x = int(x)
+                s = szs.get(x)
+                if s is None:
+                    continue
+                nx = oracle_next(pos, x, i)
+                rec_a.append(i - last_seen[x] if x in last_seen else -1)
+                conf_a.append(cmap.get(x, tau))
+                size_a.append(s)
+                lag_a.append(int(nx) - i if nx < int(NEVER) else -1)
+        last_seen[o] = i                                # causal: o is now seen at i
+    return (np.array(rec_a, dtype=np.int64), np.array(conf_a),
+            np.array(size_a, dtype=np.int64), np.array(lag_a, dtype=np.int64))
 
 
-def build_hazard(conf, size, lag):
-    """p(lag_bin | conf_bin, size_bin) as a (N_CONF, N_SIZE, N_LAG) normalised histogram.
+def build_hazard(rec, conf, lag):
+    """p(lag_bin | recency_bin, conf_bin) as a (N_REC, N_CONF, N_LAG) normalised histogram.
     Empty cells fall back to the global lag distribution so the scheduler never divides by zero."""
-    hist = np.zeros((N_CONF, N_SIZE, N_LAG), dtype=np.float64)
-    for c, s, lg in zip(conf, size, lag):
-        hist[conf_bin(c), size_bin(s), lag_bin(int(lg))] += 1.0
+    hist = np.zeros((N_REC, N_CONF, N_LAG), dtype=np.float64)
+    for r, c, lg in zip(rec, conf, lag):
+        hist[recency_bin(int(r)), conf_bin(c), lag_bin(int(lg))] += 1.0
     glob = hist.sum(axis=(0, 1))
     glob = glob / max(glob.sum(), 1.0)
-    for a in range(N_CONF):
-        for b in range(N_SIZE):
+    for a in range(N_REC):
+        for b in range(N_CONF):
             tot = hist[a, b].sum()
             hist[a, b] = hist[a, b] / tot if tot > 0 else glob
     return hist
@@ -174,15 +188,16 @@ def run(trace, cap, pos, szs, args):
         return PREDS[args.pred](trace, train_frac=tf, window=args.window, k=args.k, tau=args.tau)
 
     # ---- hazard model: TRAIN on the prefix only, then F2-evaluate on the held-out half ----
-    c_tr, s_tr, l_tr = harvest(mk(), trace, 0, cut, szs, pos)
-    hist = build_hazard(c_tr, s_tr, l_tr)
+    r_tr, c_tr, s_tr, l_tr = harvest(mk(), trace, 0, cut, szs, pos)
+    hist = build_hazard(r_tr, c_tr, l_tr)
 
-    c_ev, s_ev, l_ev = harvest(mk(), trace, cut, n, szs, pos)
+    r_ev, c_ev, s_ev, l_ev = harvest(mk(), trace, cut, n, szs, pos)
     used = l_ev >= 0
-    pred_med = np.array([median_lag_pred(hist[conf_bin(c), size_bin(s)])
-                         for c, s in zip(c_ev, s_ev)])
+    pred_med = np.array([median_lag_pred(hist[recency_bin(int(r)), conf_bin(c)])
+                         for r, c in zip(r_ev, c_ev)])
     rho = spearman(pred_med[used], l_ev[used].astype(np.float64))
-    p_never = np.array([hist[conf_bin(c), size_bin(s), NEVER_BIN] for c, s in zip(c_ev, s_ev)])
+    p_never = np.array([hist[recency_bin(int(r)), conf_bin(c), NEVER_BIN]
+                        for r, c in zip(r_ev, c_ev)])
     never_auc = auc(p_never, (~used).astype(int))
 
     # ---- survival curve S(delta): instrumented bar replay over the full trace ----
@@ -212,7 +227,7 @@ def run(trace, cap, pos, szs, args):
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
         np.savez_compressed(
             args.out, hist=hist, lag_edges=LAG_EDGES, conf_edges=CONF_EDGES, size_edges=SIZE_EDGES,
-            surv_grid=surv_grid, surv_vals=surv_vals,
+            rec_edges=REC_EDGES, surv_grid=surv_grid, surv_vals=surv_vals,
             rho=rho, never_auc=never_auc, f2_pass=f2_pass,
             pred=args.pred, tau=args.tau, k=args.k, train_frac=tf)
         print(f"  saved -> {args.out}")

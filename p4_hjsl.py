@@ -37,7 +37,7 @@ import numpy as np
 from p4_coldsplit import PREDS
 from p4_f1 import emit_vocab
 from p4_f4 import capture_ctx, conf_lookup
-from p4_hazard import CONF_EDGES, LAG_EDGES, NEVER_BIN, SIZE_EDGES, conf_bin, run as haz_run, size_bin
+from p4_hazard import LAG_EDGES, NEVER_BIN, N_CONF, N_REC, conf_bin, recency_bin, run as haz_run
 from p4_prefetch import PFCache, Prescient
 from p4_sweep import KS, prep
 
@@ -57,20 +57,21 @@ class HJSL:
         self.hist = haz["hist"]                                    # (7,7,17) p(lag|conf,size)
         self.mids = np.sqrt(LAG_EDGES[:-1] * LAG_EDGES[1:])        # (16,) geometric bin midpoints
         self.sg, self.sv = haz["surv_grid"], haz["surv_vals"]      # S(delta) step function
-        # wake offset per (conf_bin,size_bin): the gamma-quantile lag (fixed gamma -> precompute)
-        self.woff = np.zeros((7, 7))
-        for a in range(7):
-            for b in range(7):
+        # wake offset per (recency_bin,conf_bin): the gamma-quantile lag (fixed gamma -> precompute)
+        self.woff = np.zeros((N_REC, N_CONF))
+        for a in range(N_REC):
+            for b in range(N_CONF):
                 self.woff[a, b] = self._quantile(self.hist[a, b], gamma)
 
-        self.pending = {}          # obj -> (size, conf_bin, size_bin, t0, wake)
+        self.pending = {}          # obj -> (size, rec_bin, conf_bin, t0, wake)
         self.heap = []             # (wake, obj) lazy-deleted
-        self.ready = {}            # obj -> (size, conf_bin, size_bin, t0)
+        self.ready = {}            # obj -> (size, rec_bin, conf_bin, t0)
+        self.last_seen = {}        # obj -> last request index (for causal recency)
         self.tokens = 0.0
         self.spent = 0.0
 
     def reset(self):
-        self.pending, self.heap, self.ready = {}, [], {}
+        self.pending, self.heap, self.ready, self.last_seen = {}, [], {}, {}
         self.tokens = self.spent = 0.0
         r = getattr(self.base, "reset", None)
         if r:
@@ -89,9 +90,9 @@ class HJSL:
         idx = np.searchsorted(self.sg, deltas, side="right") - 1
         return np.where(idx >= 0, self.sv[np.clip(idx, 0, len(self.sv) - 1)], 1.0)
 
-    def _utility(self, cb, sb, elapsed):
+    def _utility(self, rb, cb, elapsed):
         """(U, p_future): expected hit credit of fetching NOW, and P(use still to come)."""
-        row = self.hist[cb, sb]
+        row = self.hist[rb, cb]
         mask = self.mids > elapsed
         resid = row[:16][mask]
         rs = resid.sum()
@@ -118,14 +119,16 @@ class HJSL:
                 s = self.szs.get(x)
                 if s is None or s > self.budget:
                     continue
-                cb, sb = conf_bin(cmap.get(x, tau)), size_bin(s)
+                cb = conf_bin(cmap.get(x, tau))
+                rb = recency_bin(i - self.last_seen[x] if x in self.last_seen else -1)
                 if self.defer:
                     lead = s / max(self.rate, 1.0) + self.lead_safety
-                    wake = max(int(i + self.woff[cb, sb] - lead), i)
+                    wake = max(int(i + self.woff[rb, cb] - lead), i)
                 else:
                     wake = i                                       # ablation: fetch at emission
-                self.pending[x] = (s, cb, sb, i, wake)
+                self.pending[x] = (s, rb, cb, i, wake)
                 heapq.heappush(self.heap, (wake, x))
+        self.last_seen[o] = i                                      # causal recency: o seen at i
 
         # (2) move due candidates into the ready set
         while self.heap and self.heap[0][0] <= i:
@@ -133,21 +136,21 @@ class HJSL:
             info = self.pending.pop(x, None)
             if info is None:
                 continue                                           # stale (already handled)
-            s, cb, sb, t0, _ = info
-            self.ready[x] = (s, cb, sb, t0)
+            s, rb, cb, t0, _ = info
+            self.ready[x] = (s, rb, cb, t0)
 
         if not self.ready or self.tokens < min(v[0] for v in self.ready.values()):
             return []
 
         # (3) score ready candidates; expire the hopeless ones
         scored, drop = [], []
-        for x, (s, cb, sb, t0) in self.ready.items():
+        for x, (s, rb, cb, t0) in self.ready.items():
             if x in cached:                                        # demand-filled -> cancel
                 drop.append(x); continue
             elapsed = i - t0
             if elapsed > self.max_wait:
                 drop.append(x); continue
-            U, p_future = self._utility(cb, sb, elapsed)
+            U, p_future = self._utility(rb, cb, elapsed)
             if p_future < self.floor or U <= 0:
                 drop.append(x); continue
             scored.append((U / s, x, s))
