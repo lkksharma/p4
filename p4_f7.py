@@ -89,13 +89,13 @@ class CausalTimedCover:
                     self.woff[a, b, d] = _quantile(hist[a, b, d], gamma)
                     self.wmed[a, b, d] = _quantile(hist[a, b, d], 0.5)
         self.last_seen, self.freq = {}, {}
-        self.pending, self.heap = {}, []                  # obj -> (size, true_use); heap (wake, obj)
+        self.pending, self.heap = {}, []                  # obj -> (size, true_use, emit_time); heap (wake, obj)
         self.tokens = self.spent = 0.0
         self.on_time = self.late = 0
 
     def reset(self):
         self.last_seen, self.freq = {}, {}
-        self.pending, self.heap = {}, []
+        self.pending, self.heap, self._heap_size = {}, [], 0
         self.tokens = self.spent = 0.0
         self.on_time = self.late = 0
         self.t_start = time.time()
@@ -140,8 +140,11 @@ class CausalTimedCover:
                     cb = conf_bin(cmap.get(x, tau))
                     off = self.wmed[rb, fb, cb] if self.timing == "point" else self.woff[rb, fb, cb]
                     wake = int(i + off - self.lead)        # causal: fetch at predicted use time
-                self.pending[x] = (s, int(nx))
-                heapq.heappush(self.heap, (max(wake, i), x))
+                wake = max(wake, i)
+                if wake > i + self.max_wait:               # discard if wake is too far in the future
+                    continue
+                self.pending[x] = (s, int(nx), i)          # track emit_time for staleness checks
+                heapq.heappush(self.heap, (wake, x))
         self.last_seen[o] = i
         self.freq[o] = self.freq.get(o, 0) + 1
 
@@ -152,26 +155,34 @@ class CausalTimedCover:
             info = self.pending.get(x)
             if info is None:
                 continue                                   # already handled
-            s, nx = info
+            s, nx, emit_t = info
             if x in cached:                                # demand-filled while pending -> cancel
                 self.pending.pop(x, None); continue
-            due.append((s, x, nx))
+            if i - emit_t > self.max_wait:                 # stale: waited too long -> discard
+                self.pending.pop(x, None); continue
+            due.append((s, x, nx, emit_t))
         due.sort()                                         # smallest-first (head-of-line safety)
         out = []
-        for idx, (s, x, nx) in enumerate(due):
+        for idx, (s, x, nx, emit_t) in enumerate(due):
             if self.spent + s > self.budget:
                 self.pending.pop(x, None)                  # will never afford this -> discard
                 continue
             if self.tokens < s:
-                # Can't afford this. Since due is sorted smallest-first, we can't afford the rest either.
+                # Can't afford this tick. Re-push with a bounded wait.
                 wait = int((s - self.tokens) / self.rate) + 1 if self.rate > 0 else 1_000_000
-                heapq.heappush(self.heap, (i + wait, x))
-                for s2, x2, nx2 in due[idx+1:]:
+                if i + wait - emit_t > self.max_wait:      # would exceed max_wait -> discard
+                    self.pending.pop(x, None)
+                else:
+                    heapq.heappush(self.heap, (i + wait, x))
+                for s2, x2, nx2, et2 in due[idx+1:]:
                     if self.spent + s2 > self.budget:
                         self.pending.pop(x2, None)
                     else:
                         w2 = int((s2 - self.tokens) / self.rate) + 1 if self.rate > 0 else 1_000_000
-                        heapq.heappush(self.heap, (i + w2, x2))
+                        if i + w2 - et2 > self.max_wait:
+                            self.pending.pop(x2, None)
+                        else:
+                            heapq.heappush(self.heap, (i + w2, x2))
                 break
             
             self.tokens -= s; self.spent += s
