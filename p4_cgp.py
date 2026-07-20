@@ -148,9 +148,9 @@ class CGP:
         return out
 
 
-def _cgp_run(cap, pos, szs, trace, tf, sch, hits=False):
+def _cgp_run(cap, pos, szs, trace, tf, sch, hits=False, progress=None):
     return PFCache(cap, "s3fifo", sch, positions=pos, sizes=szs, pf_byte_rate=None).run(
-        trace, cold_train_frac=tf, return_hits=hits)
+        trace, cold_train_frac=tf, return_hits=hits, progress=progress)
 
 
 def run(trace, cap, pos, szs, args):
@@ -166,16 +166,17 @@ def run(trace, cap, pos, szs, args):
     if args.verbose:
         print(f"  [build] predictors ({time.time()-t0:.1f}s)", file=sys.stderr, flush=True)
 
-    base = PFCache(cap, "s3fifo", None, positions=pos, sizes=szs).run(trace)
+    pg = (lambda lbl: lbl if args.tqdm else None)           # tqdm bar label, or None (no bar)
+    base = PFCache(cap, "s3fifo", None, positions=pos, sizes=szs).run(trace, progress=pg("BASE"))
     bar = PFCache(cap, "s3fifo", bar_pred, positions=pos, sizes=szs).run(
-        trace, cold_train_frac=tf, return_hits=True)
+        trace, cold_train_frac=tf, return_hits=True, progress=pg("BAR"))
     rate = bar["prefetch_bytes"] / max(n, 1)
     budget = bar["prefetch_bytes"]
     bar_tx = bar["origin_bytes"] / max(base["origin_bytes"], 1)
     # BAR-CAP: the bar under the SAME token bucket CGP faces -> isolates scheduling from the
     # burst-vs-bucket protocol cost (HJS-L / Policy-1 precedent). Headline gate is vs BAR.
     barc = PFCache(cap, "s3fifo", bar_pred, positions=pos, sizes=szs, pf_byte_rate=rate).run(
-        trace, cold_train_frac=tf, return_hits=True)
+        trace, cold_train_frac=tf, return_hits=True, progress=pg("BAR-CAP"))
     protocol = 100.0 * (barc["ohr"] - bar["ohr"])
 
     print(f"\n  {args.trace}   [CGP | wide k={args.wide_k} top_m={args.wide_top_m} | fire k={args.fire_k}]")
@@ -200,8 +201,8 @@ def run(trace, cap, pos, szs, args):
                     continue                                # fire-only is W_arm-independent
                 fire_pred.set_params(tau=tfire)
                 sch = CGP(wide_pred, fire_pred, pos, szs, rate, budget, wa, tfire, be, args.fire_k,
-                          cap, verbose=(args.verbose and args.tune_verbose), n=n)
-                r = _cgp_run(cap, pos, szs, trace, tf, sch)
+                          cap, verbose=(args.verbose and args.tune_verbose and not args.tqdm), n=n)
+                r = _cgp_run(cap, pos, szs, trace, tf, sch, progress=pg(f"tune b{be:.0f} t{tfire} w{wa}"))
                 ohr = r["ohr"]; d = 100.0 * (ohr - bar["ohr"])
                 pfb = r["prefetch_bytes"] / max(budget, 1)
                 tag = "  (fire-only)" if be == 0.0 else ""
@@ -222,13 +223,13 @@ def run(trace, cap, pos, szs, args):
     # ---- finalize: best CGP + best fire-only, WITH hit series, bootstrap CIs vs BAR and BAR-CAP ----
     fire_pred.set_params(tau=tfire)
     cgp_sch = CGP(wide_pred, fire_pred, pos, szs, rate, budget, wa, tfire, be, args.fire_k, cap,
-                  verbose=args.verbose, n=n)
-    cgp = _cgp_run(cap, pos, szs, trace, tf, cgp_sch, hits=True)
+                  verbose=(args.verbose and not args.tqdm), n=n)
+    cgp = _cgp_run(cap, pos, szs, trace, tf, cgp_sch, hits=True, progress=pg("CGP-final"))
 
     fire_pred.set_params(tau=fo_tfire)
     fo_sch = CGP(wide_pred, fire_pred, pos, szs, rate, budget, warms[0], fo_tfire, 0.0, args.fire_k,
                  cap, verbose=False, n=n)
-    fo = _cgp_run(cap, pos, szs, trace, tf, fo_sch, hits=True)
+    fo = _cgp_run(cap, pos, szs, trace, tf, fo_sch, hits=True, progress=pg("fire-only"))
 
     def corr_ci(arm_hits, ref_hits, ref_ohr, arm_ohr):
         d = arm_hits.astype(np.float64) - ref_hits.astype(np.float64)
@@ -282,7 +283,7 @@ def selftest():
         trace = "SYNTH"; limit = 60000; cache_frac = 0.01; pred = "markov1"; tau = 0.05; k = 1
         window = 16; train_frac = 0.5; wide_k = 16; wide_top_m = 16; wide_tau = 0.0; fire_k = 8
         betas = "0,3"; tau_fires = "0.02,0.05"; w_arms = "2000,10000"; f5_ref = None
-        gate = 2.5; blocks = 100; resamples = 500; seed = 0; verbose = False; tune_verbose = False
+        gate = 2.5; blocks = 100; resamples = 500; seed = 0; verbose = False; tqdm = False; tune_verbose = False
     a = A()
     trace, cap, pos, szs = prep("SYNTH", a.limit, a.cache_frac)
     r = run(trace, cap, pos, szs, a)
@@ -310,8 +311,13 @@ def main():
     ap.add_argument("--f5-ref", type=float, default=None,
                     help="F5 corridor for %%-capture context (wiki 10.41, cluster50 11.42 from results.md)")
     ap.add_argument("--gate", type=float, default=2.5, help="pre-registered OHR-pt gate vs BAR")
-    ap.add_argument("--verbose", action="store_true")
-    ap.add_argument("--tune-verbose", action="store_true", help="per-arm progress during the tuning grid too")
+    ap.add_argument("--verbose", action="store_true",
+                    help="clean newline progress to stderr (flush-safe, parallel-friendly)")
+    ap.add_argument("--tqdm", action="store_true",
+                    help="live tqdm bar per replay arm (BASE/BAR/tune/CGP/fire-only). Best for a "
+                         "SINGLE run; with two traces in parallel the bars interleave -- use "
+                         "--verbose for parallel instead. Overrides --verbose stderr prints.")
+    ap.add_argument("--tune-verbose", action="store_true", help="per-arm stderr progress during the tuning grid too")
     ap.add_argument("--blocks", type=int, default=1000)
     ap.add_argument("--resamples", type=int, default=10000)
     ap.add_argument("--seed", type=int, default=0)
