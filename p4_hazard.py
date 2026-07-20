@@ -203,7 +203,9 @@ def median_lag_pred(hist_row):
     return float(np.sqrt(LAG_EDGES[b] * LAG_EDGES[b + 1]))       # geometric bin midpoint
 
 
-def run(trace, cap, pos, szs, args):
+def run(trace, cap, pos, szs, args, metrics=None):
+    """metrics: optional dict the caller may pass to receive {rho, never_auc, f2_pass, s100}
+    without parsing stdout -- return value stays the bare f2_pass bool for compatibility."""
     tf = args.train_frac
     n = trace["n"]
     cut = int(n * tf)                                  # predictor's own training boundary
@@ -256,6 +258,9 @@ def run(trace, cap, pos, szs, args):
     surv_vals = survival_km(d, cen, surv_grid)
 
     f2_pass = (not np.isnan(rho) and rho >= 0.20) and (not np.isnan(never_auc) and never_auc >= 0.60)
+    if metrics is not None:
+        metrics.update(rho=float(rho), never_auc=float(never_auc), f2_pass=bool(f2_pass),
+                       s100=float(survival_km(d, cen, np.array([100]))[0]))
 
     tr_never = float((l_tr < 0).mean()) if len(l_tr) else float("nan")
     ev_never = float((~used).mean()) if len(l_ev) else float("nan")
