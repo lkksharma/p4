@@ -1,0 +1,15 @@
+[trace] data/wiki_2019t.oracleGeneral: 2,000,000 requests, 877,316 objects, footprint 22,207,399,035 B, cache 1.0% = 222,073,990 B  (3.3s)
+  [hazard] harvesting train window [1,000,000,1,500,000) -- full-trace replay, silent, ~10-25 min at wide k...
+  [hazard] harvesting eval window [1,500,000,2,000,000)...
+  [hazard] survival replay...
+
+  data/wiki_2019t.oracleGeneral   [hazard: markov2 tau=0.0 k=32]
+  split  predictor [0,1,000,000)  hazard-train [1,000,000,1,500,000)  F2-eval [1,500,000,2,000,000)   horizon 100,000
+  hazard-train emissions 8,277,448 (never 66.0%)   F2-eval emissions 6,394,148 (never 66.6%)
+  survival events 13,567,877   median lifetime 54 req   S(100)=0.055
+
+  F2  Spearman(pred median lag, true lag)  +0.684   [gate >= 0.20]
+  F2  never-bin AUC (P(never) vs used)     0.937   [gate >= 0.60]
+  F2 GATE  PASS -- when is learnable; build the scheduler
+  saved -> haz/wiki_wide.npz
+

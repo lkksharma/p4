@@ -1,0 +1,15 @@
+[trace] data/cluster50.sample10.oracleGeneral: 2,000,000 requests, 138,100 objects, footprint 2,749,466,352 B, cache 1.0% = 27,494,663 B  (1.3s)
+  [hazard] harvesting train window [1,000,000,1,500,000) -- full-trace replay, silent, ~10-25 min at wide k...
+  [hazard] harvesting eval window [1,500,000,2,000,000)...
+  [hazard] survival replay...
+
+  data/cluster50.sample10.oracleGeneral   [hazard: markov3 tau=0.0 k=16]
+  split  predictor [0,1,000,000)  hazard-train [1,000,000,1,500,000)  F2-eval [1,500,000,2,000,000)   horizon 100,000
+  hazard-train emissions 7,139,975 (never 60.5%)   F2-eval emissions 5,641,939 (never 60.1%)
+  survival events 10,280,076   median lifetime 22 req   S(100)=0.135
+
+  F2  Spearman(pred median lag, true lag)  +0.403   [gate >= 0.20]
+  F2  never-bin AUC (P(never) vs used)     0.816   [gate >= 0.60]
+  F2 GATE  PASS -- when is learnable; build the scheduler
+  saved -> haz/cluster50_wide.npz
+

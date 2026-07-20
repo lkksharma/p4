@@ -456,6 +456,40 @@ construction check passes. **PENDING (final):** repaired-harness re-run at gamma
 with the k=1 hazard (the pre-registered primary), then the fair-shot fallback (hazard retrained on
 the WIDE stream -- `p4_hazard.py --top-m` wired in 77050b4 for exactly this).
 
+### 7h. F7 FINAL `[LOG]` -- VALID construction, decisive FAIL, fallback confirms. Capture rung CLOSED.
+
+Repaired harness (oracle arm unbounded, wake-keyed causal prune, construction invariant). Logs
+`f7v2_wiki_g0.1.log`, `f7v2_c50_g0.1.log` (primary, k=1 hazard); `haz_{wiki,c50}_wide.log` +
+`f7v2_{wiki,c50}_g0.1_wide.log` (fair-shot fallback, hazard retrained on the wide stream). gamma=0.1
+(most forgiving / earliest wake). **Construction check PASSES on both** -> quotable.
+
+| run | oracle (construction) | model corridor | CI | on-time | overshoot | prec | pf issued | GATE |
+|---|---|---|---|---|---|---|---|---|
+| wiki primary | +9.69 (93.1% of F5), 100% on-time | **-40.06** | [-42.73,-37.39] | 69.7% | 18.5% | 0.062 | 1.02M | FAIL |
+| c50 primary | +11.69 (102.4% of F5), 100% on-time | **-26.01** | [-27.88,-24.13] | 72.2% | 12.1% | 0.053 | 1.49M | FAIL |
+| wiki fallback (wide haz) | (same oracle) | **-40.40** | [-43.09,-37.69] | 58.7% | 21.4% | 0.077 | 0.77M | FAIL |
+| c50 fallback (wide haz) | (same oracle) | **-25.22** | [-27.16,-23.26] | 74.8% | 12.7% | 0.053 | 1.69M | FAIL |
+
+**Fair-shot fallback is the clincher, not a rescue.** The wide-stream hazard is MORE rank-learnable
+than the k=1 one (wiki Spearman 0.60->**0.684**, AUC 0.937; c50 0.403, AUC 0.816 -- both clear F2),
+yet capture does NOT improve (wiki -40.40 vs -40.06; c50 -25.22 vs -26.01, within noise). **A
+better-fit forecaster places insertions no better.** This is the decisive, doubly-confirmed evidence
+for rank-learnable != placeable.
+
+**Endogenous slack, measured directly:** the wide-stream survival replay gives `S(100)=0.055` (wiki,
+median residence 54 req) and `0.135` (c50, 22 req) -- collapsed from the bar's `S(100)=1.0`. Every
+funded object is one F5 also funds (clairvoyant selection, nx<NEVER), yet precision is 0.05-0.08 and
+the policy issues 0.8-1.7M fetches vs the bar's ~1.0M: the wide net under causal timing floods the
+cache, thrashing the residence window it must hit. on-time 59-75% but precision 0.05 -> even on-time
+fetches are mostly evicted before use. Both failure modes (LATE overshoot + early-evict) pincer at
+every gamma.
+
+**STANDING CONCLUSION -- the capture ladder is CLOSED, negative.** The corridor is reachable in
+principle (F5) but no causal policy captures it: RL arbitration unnecessary (F4'), at-emission
+insufficient (Policy 1), causal JIT timing unreachable (F7), and the pre-registered fallback fails
+too. The corridor is CLAIRVOYANCE-PRICED. This is the paper's Part II. Numbers locked into paper.tex
+(commit pending).
+
 ## 8b. Cross-domain screen: LLM KV-cache serving (Mooncake, FAST'25) `[LOG]` -- FORK 1, clean
 
 New file `p4_llmcache.py` (commits 29bbb69, 3d3dea3): the instrument ported to KV-cache WARMING on

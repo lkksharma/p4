@@ -1,0 +1,41 @@
+[trace] data/cluster50.sample10.oracleGeneral: 2,000,000 requests, 138,100 objects, footprint 2,749,466,352 B, cache 1.0% = 27,494,663 B  (1.3s)
+  [prelude] base + bar replays (silent, a few minutes)...
+  [prelude] coverable set + F5 ceiling replay (wide k=16) -- the SLOW, SILENT part, ~10-25 min on 2M reqs; not a hang...
+
+  data/cluster50.sample10.oracleGeneral   [F7 JIT-realizability | k_wide=16 gamma=0.1]
+  BAR       OHR 0.7080   pf 665,252 (prec 0.863)
+  F5 CEIL   OHR 0.8221   corridor +11.42 pts   (coverage 71.6%) <- the denominator (wide + PERFECT JIT)
+  ------------------------------------------------------------------------------
+  >> timing arm 'oracle' starting (2,000,000 reqs)...
+    [oracle]   200,000/2,000,000 ( 10%) | LATE   0% | pool     11 | spent 0.10x | 87530 req/s | ETA    0m
+    [oracle]   400,000/2,000,000 ( 20%) | LATE   0% | pool      7 | spent 0.20x | 85741 req/s | ETA    0m
+    [oracle]   600,000/2,000,000 ( 30%) | LATE   0% | pool      5 | spent 0.30x | 87320 req/s | ETA    0m
+    [oracle]   800,000/2,000,000 ( 40%) | LATE   0% | pool      8 | spent 0.40x | 89017 req/s | ETA    0m
+    [oracle] 1,000,000/2,000,000 ( 50%) | LATE   0% | pool      9 | spent 0.50x | 89865 req/s | ETA    0m
+    [oracle] 1,200,000/2,000,000 ( 60%) | LATE   0% | pool 21,020 | spent 0.56x | 76342 req/s | ETA    0m
+    [oracle] 1,400,000/2,000,000 ( 70%) | LATE   0% | pool 21,360 | spent 0.63x | 69635 req/s | ETA    0m
+    [oracle] 1,600,000/2,000,000 ( 80%) | LATE   0% | pool 22,870 | spent 0.71x | 64703 req/s | ETA    0m
+    [oracle] 1,800,000/2,000,000 ( 90%) | LATE   0% | pool 23,779 | spent 0.81x | 61945 req/s | ETA    0m
+  [oracle] OHR 0.8248   pf 727,064 useful 727,064 (prec 1.000)   spent 0.93x  (= F5 ceiling / construction check)
+           on-time 727,064 (100.0%)   LATE 0 (0.0%)   forecast-overshoot 0.0% (wake > true use at emission)
+           corridor +11.69 [+10.23,+13.18]   capture 102.4% of F5 | pf bytes 0.88x   inv:all pass
+  >> timing arm 'model' starting (2,000,000 reqs)...
+    [model ]   200,000/2,000,000 ( 10%) | LATE  92% | pool  4,896 | spent 0.10x |  2389 req/s | ETA   13m
+    [model ]   400,000/2,000,000 ( 20%) | LATE  93% | pool  4,638 | spent 0.20x |  1720 req/s | ETA   16m
+    [model ]   600,000/2,000,000 ( 30%) | LATE  94% | pool  4,212 | spent 0.30x |  1642 req/s | ETA   14m
+    [model ]   800,000/2,000,000 ( 40%) | LATE  94% | pool  2,803 | spent 0.40x |  1849 req/s | ETA   11m
+    [model ] 1,000,000/2,000,000 ( 50%) | LATE  94% | pool  1,834 | spent 0.50x |  2190 req/s | ETA    8m
+    [model ] 1,200,000/2,000,000 ( 60%) | LATE  53% | pool  4,938 | spent 0.60x |  2081 req/s | ETA    6m
+    [model ] 1,400,000/2,000,000 ( 70%) | LATE  39% | pool  5,067 | spent 0.70x |  2002 req/s | ETA    5m
+    [model ] 1,600,000/2,000,000 ( 80%) | LATE  32% | pool  4,713 | spent 0.80x |  1920 req/s | ETA    3m
+    [model ] 1,800,000/2,000,000 ( 90%) | LATE  28% | pool  4,119 | spent 0.90x |  1856 req/s | ETA    2m
+  [model ] OHR 0.4558   pf 1,685,889 useful 89,032 (prec 0.053)   spent 1.00x
+           on-time 1,260,436 (74.8%)   LATE 425,453 (25.2%)   forecast-overshoot 12.7% (wake > true use at emission)
+           corridor -25.22 [-27.16,-23.26]   capture -220.9% of F5 | pf bytes 0.95x   inv:all pass
+           -> LATE tracks forecast-overshoot: the causal wake genuinely overshoots the use. Lower --gamma (fetch earlier) and re-check.
+  ------------------------------------------------------------------------------
+  CONSTRUCTION    oracle-timing = 102% of F5 (the same-mechanics JIT ceiling)
+  CAUSAL TIMING   model = -216% of the JIT ceiling (-221% of F5) | on-time 75% | forecast-overshoot 13%
+  CONFOUND        LATE 25% vs forecast-overshoot 13% -- the gap is bandwidth-queuing under the bar-sized bucket, NOT causal-timing error
+  GATE (>=50% ceiling)  FAIL -- causal use-lag timing cannot place the JIT insertion (CI includes 0). The corridor needs CLAIRVOYANT timing; no causal policy captures it -- the measurement half carries the paper, plus the Necessity-Ladder triple-kill.
+

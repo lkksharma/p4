@@ -1,0 +1,41 @@
+[trace] data/wiki_2019t.oracleGeneral: 2,000,000 requests, 877,316 objects, footprint 22,207,399,035 B, cache 1.0% = 222,073,990 B  (2.9s)
+  [prelude] base + bar replays (silent, a few minutes)...
+  [prelude] coverable set + F5 ceiling replay (wide k=32) -- the SLOW, SILENT part, ~10-25 min on 2M reqs; not a hang...
+
+  data/wiki_2019t.oracleGeneral   [F7 JIT-realizability | k_wide=32 gamma=0.1]
+  BAR       OHR 0.5531   pf 982,954 (prec 0.874)
+  F5 CEIL   OHR 0.6572   corridor +10.41 pts   (coverage 74.1%) <- the denominator (wide + PERFECT JIT)
+  ------------------------------------------------------------------------------
+  >> timing arm 'oracle' starting (2,000,000 reqs)...
+    [oracle]   200,000/2,000,000 ( 10%) | LATE   0% | pool    668 | spent 0.10x | 61303 req/s | ETA    0m
+    [oracle]   400,000/2,000,000 ( 20%) | LATE   0% | pool    585 | spent 0.20x | 64905 req/s | ETA    0m
+    [oracle]   600,000/2,000,000 ( 30%) | LATE   0% | pool    685 | spent 0.30x | 65892 req/s | ETA    0m
+    [oracle]   800,000/2,000,000 ( 40%) | LATE   0% | pool    699 | spent 0.40x | 66427 req/s | ETA    0m
+    [oracle] 1,000,000/2,000,000 ( 50%) | LATE   0% | pool    423 | spent 0.50x | 66543 req/s | ETA    0m
+    [oracle] 1,200,000/2,000,000 ( 60%) | LATE   0% | pool 41,834 | spent 0.59x | 57694 req/s | ETA    0m
+    [oracle] 1,400,000/2,000,000 ( 70%) | LATE   0% | pool 41,501 | spent 0.69x | 52673 req/s | ETA    0m
+    [oracle] 1,600,000/2,000,000 ( 80%) | LATE   0% | pool 40,476 | spent 0.79x | 49266 req/s | ETA    0m
+    [oracle] 1,800,000/2,000,000 ( 90%) | LATE   0% | pool 39,974 | spent 0.89x | 47341 req/s | ETA    0m
+  [oracle] OHR 0.6500   pf 1,017,138 useful 1,017,138 (prec 1.000)   spent 0.98x  (= F5 ceiling / construction check)
+           on-time 1,017,138 (100.0%)   LATE 0 (0.0%)   forecast-overshoot 0.0% (wake > true use at emission)
+           corridor +9.69 [+8.07,+11.33]   capture 93.1% of F5 | pf bytes 0.93x   inv:all pass
+  >> timing arm 'model' starting (2,000,000 reqs)...
+    [model ]   200,000/2,000,000 ( 10%) | LATE  74% | pool  1,845 | spent 0.04x | 54403 req/s | ETA    1m
+    [model ]   400,000/2,000,000 ( 20%) | LATE  85% | pool  2,258 | spent 0.13x | 51961 req/s | ETA    1m
+    [model ]   600,000/2,000,000 ( 30%) | LATE  89% | pool  2,466 | spent 0.23x | 49998 req/s | ETA    0m
+    [model ]   800,000/2,000,000 ( 40%) | LATE  90% | pool  2,537 | spent 0.35x | 48754 req/s | ETA    0m
+    [model ] 1,000,000/2,000,000 ( 50%) | LATE  92% | pool  2,691 | spent 0.47x | 47828 req/s | ETA    0m
+    [model ] 1,200,000/2,000,000 ( 60%) | LATE  64% | pool  4,349 | spent 0.60x |  2643 req/s | ETA    5m
+    [model ] 1,400,000/2,000,000 ( 70%) | LATE  50% | pool  4,667 | spent 0.70x |  1427 req/s | ETA    7m
+    [model ] 1,600,000/2,000,000 ( 80%) | LATE  40% | pool  4,401 | spent 0.80x |  1031 req/s | ETA    6m
+    [model ] 1,800,000/2,000,000 ( 90%) | LATE  34% | pool  4,476 | spent 0.90x |   848 req/s | ETA    4m
+  [model ] OHR 0.1525   pf 1,016,859 useful 62,976 (prec 0.062)   spent 1.00x
+           on-time 708,266 (69.7%)   LATE 308,593 (30.3%)   forecast-overshoot 18.5% (wake > true use at emission)
+           corridor -40.06 [-42.73,-37.39]   capture -385.0% of F5 | pf bytes 0.98x   inv:all pass
+           -> LATE tracks forecast-overshoot: the causal wake genuinely overshoots the use. Lower --gamma (fetch earlier) and re-check.
+  ------------------------------------------------------------------------------
+  CONSTRUCTION    oracle-timing = 93% of F5 (the same-mechanics JIT ceiling)
+  CAUSAL TIMING   model = -414% of the JIT ceiling (-385% of F5) | on-time 70% | forecast-overshoot 19%
+  CONFOUND        LATE 30% vs forecast-overshoot 19% -- the gap is bandwidth-queuing under the bar-sized bucket, NOT causal-timing error
+  GATE (>=50% ceiling)  FAIL -- causal use-lag timing cannot place the JIT insertion (CI includes 0). The corridor needs CLAIRVOYANT timing; no causal policy captures it -- the measurement half carries the paper, plus the Necessity-Ladder triple-kill.
+

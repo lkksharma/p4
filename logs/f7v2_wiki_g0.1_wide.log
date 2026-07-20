@@ -1,0 +1,41 @@
+[trace] data/wiki_2019t.oracleGeneral: 2,000,000 requests, 877,316 objects, footprint 22,207,399,035 B, cache 1.0% = 222,073,990 B  (2.6s)
+  [prelude] base + bar replays (silent, a few minutes)...
+  [prelude] coverable set + F5 ceiling replay (wide k=32) -- the SLOW, SILENT part, ~10-25 min on 2M reqs; not a hang...
+
+  data/wiki_2019t.oracleGeneral   [F7 JIT-realizability | k_wide=32 gamma=0.1]
+  BAR       OHR 0.5531   pf 982,954 (prec 0.874)
+  F5 CEIL   OHR 0.6572   corridor +10.41 pts   (coverage 74.1%) <- the denominator (wide + PERFECT JIT)
+  ------------------------------------------------------------------------------
+  >> timing arm 'oracle' starting (2,000,000 reqs)...
+    [oracle]   200,000/2,000,000 ( 10%) | LATE   0% | pool    668 | spent 0.10x | 65262 req/s | ETA    0m
+    [oracle]   400,000/2,000,000 ( 20%) | LATE   0% | pool    585 | spent 0.20x | 67524 req/s | ETA    0m
+    [oracle]   600,000/2,000,000 ( 30%) | LATE   0% | pool    685 | spent 0.30x | 67991 req/s | ETA    0m
+    [oracle]   800,000/2,000,000 ( 40%) | LATE   0% | pool    699 | spent 0.40x | 67680 req/s | ETA    0m
+    [oracle] 1,000,000/2,000,000 ( 50%) | LATE   0% | pool    423 | spent 0.50x | 67493 req/s | ETA    0m
+    [oracle] 1,200,000/2,000,000 ( 60%) | LATE   0% | pool 41,834 | spent 0.59x | 57618 req/s | ETA    0m
+    [oracle] 1,400,000/2,000,000 ( 70%) | LATE   0% | pool 41,501 | spent 0.69x | 52660 req/s | ETA    0m
+    [oracle] 1,600,000/2,000,000 ( 80%) | LATE   0% | pool 40,476 | spent 0.79x | 49401 req/s | ETA    0m
+    [oracle] 1,800,000/2,000,000 ( 90%) | LATE   0% | pool 39,974 | spent 0.89x | 47579 req/s | ETA    0m
+  [oracle] OHR 0.6500   pf 1,017,138 useful 1,017,138 (prec 1.000)   spent 0.98x  (= F5 ceiling / construction check)
+           on-time 1,017,138 (100.0%)   LATE 0 (0.0%)   forecast-overshoot 0.0% (wake > true use at emission)
+           corridor +9.69 [+8.07,+11.33]   capture 93.1% of F5 | pf bytes 0.93x   inv:all pass
+  >> timing arm 'model' starting (2,000,000 reqs)...
+    [model ]   200,000/2,000,000 ( 10%) | LATE  84% | pool  1,159 | spent 0.04x | 57021 req/s | ETA    1m
+    [model ]   400,000/2,000,000 ( 20%) | LATE  91% | pool  1,822 | spent 0.12x | 53578 req/s | ETA    0m
+    [model ]   600,000/2,000,000 ( 30%) | LATE  93% | pool  2,226 | spent 0.22x | 51424 req/s | ETA    0m
+    [model ]   800,000/2,000,000 ( 40%) | LATE  94% | pool  2,298 | spent 0.34x | 50361 req/s | ETA    0m
+    [model ] 1,000,000/2,000,000 ( 50%) | LATE  95% | pool  2,495 | spent 0.46x | 49230 req/s | ETA    0m
+    [model ] 1,200,000/2,000,000 ( 60%) | LATE  72% | pool  4,128 | spent 0.60x |  9897 req/s | ETA    1m
+    [model ] 1,400,000/2,000,000 ( 70%) | LATE  60% | pool  4,377 | spent 0.70x |  5631 req/s | ETA    2m
+    [model ] 1,600,000/2,000,000 ( 80%) | LATE  52% | pool  4,342 | spent 0.80x |  4125 req/s | ETA    2m
+    [model ] 1,800,000/2,000,000 ( 90%) | LATE  46% | pool  4,233 | spent 0.90x |  3415 req/s | ETA    1m
+  [model ] OHR 0.1492   pf 767,269 useful 59,103 (prec 0.077)   spent 1.00x
+           on-time 450,394 (58.7%)   LATE 316,875 (41.3%)   forecast-overshoot 21.4% (wake > true use at emission)
+           corridor -40.40 [-43.09,-37.69]   capture -388.2% of F5 | pf bytes 0.99x   inv:all pass
+           -> LATE tracks forecast-overshoot: the causal wake genuinely overshoots the use. Lower --gamma (fetch earlier) and re-check.
+  ------------------------------------------------------------------------------
+  CONSTRUCTION    oracle-timing = 93% of F5 (the same-mechanics JIT ceiling)
+  CAUSAL TIMING   model = -417% of the JIT ceiling (-388% of F5) | on-time 59% | forecast-overshoot 21%
+  CONFOUND        LATE 41% vs forecast-overshoot 21% -- the gap is bandwidth-queuing under the bar-sized bucket, NOT causal-timing error
+  GATE (>=50% ceiling)  FAIL -- causal use-lag timing cannot place the JIT insertion (CI includes 0). The corridor needs CLAIRVOYANT timing; no causal policy captures it -- the measurement half carries the paper, plus the Necessity-Ladder triple-kill.
+
