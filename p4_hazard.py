@@ -211,7 +211,8 @@ def run(trace, cap, pos, szs, args):
     H = args.horizon
 
     def mk():
-        return PREDS[args.pred](trace, train_frac=tf, window=args.window, k=args.k, tau=args.tau)
+        return PREDS[args.pred](trace, train_frac=tf, window=args.window, k=args.k, tau=args.tau,
+                                top_m=getattr(args, "top_m", 16))
 
     # ---- THREE-WAY SPLIT (this is load-bearing, not hygiene) --------------------------------
     # [0, cut)     the PREDICTOR trains here
@@ -302,6 +303,12 @@ def main():
     ap.add_argument("--tau", type=float)
     ap.add_argument("--k", type=int)
     ap.add_argument("--window", type=int, default=16)
+    ap.add_argument("--top-m", type=int, default=16,
+                    help="successors stored per context in the predictor. Default 16 = the narrow "
+                         "bar config. Set the WIDE config (e.g. --k 32 --tau 0.0 --top-m 32) to "
+                         "train the hazard model on the wide emission stream -- the pre-registered "
+                         "F7 fair-shot fallback. The survival/F2 outputs then also describe the "
+                         "wide stream, which is the point.")
     ap.add_argument("--train-frac", type=float, default=0.5,
                     help="predictor training fraction -- must match the bar config")
     ap.add_argument("--haz-frac", type=float, default=0.75,

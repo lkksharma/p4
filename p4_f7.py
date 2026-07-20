@@ -205,19 +205,22 @@ class CausalTimedCover:
                 self.late += 1
             out.append(x)
 
-        # (3) BOUND THE POOL -- keep only the maxpool SMALLEST-size candidates carried between
-        # requests (Policy 1's WideMarket cap, p4_policy1.py:177-183, re-keyed to F7's funding key).
-        # F7 funds smallest-first (due.sort above), so under the wide net's heavy oversubscription a
-        # candidate larger than the maxpool smallest is perpetually outranked by fresher smaller ones
-        # and ages out unfunded -- dropping it changes no funding decision (confirm with a --max-pool
-        # sweep). Keyed by SIZE, never by wake (all wakes collapse to ~i at low gamma, so wake cannot
-        # discriminate) nor by true-use nx (that would leak clairvoyance into the causal arm's pool
-        # management). At end-of-request every live pending item has exactly one heap entry, so pruning
-        # the heap by size and rebuilding pending from the survivors bounds BOTH structures.
-        if len(self.heap) > self.maxpool:
-            kept = heapq.nsmallest(
-                self.maxpool, self.heap,
-                key=lambda e: self.pending[e[1]][0] if e[1] in self.pending else float("inf"))
+        # (3) BOUND THE POOL -- causal arms only; run() passes maxpool=0 for the oracle arm.
+        # The oracle arm is the construction check / the gate's DENOMINATOR and must be exact:
+        # pruning it drops future-waking candidates it WOULD later fund (tokens are plentiful in
+        # the out-of-sample half), freezing spend. Measured on wiki: a size-keyed prune froze
+        # oracle spend at 0.52x and read capture -60% of F5 vs +93% unpruned. It never hung
+        # unpruned (wakes spread at true use times keep its due-set tiny), so it needs no cap.
+        # For the causal arms keep the maxpool SOONEST-WAKE entries (the raw heap key): funding is
+        # wake-gated, so this preserves the funding frontier; re-pushed entries carry
+        # affordability-ordered wakes, and the far-wake tail is displaced by fresher sooner
+        # candidates before it could ever be funded. NOT keyed by size (drops the soonest-due
+        # large candidates -- the measured oracle-corruption bug above) and NOT by true-use nx
+        # (clairvoyance leak into the causal arm). Hysteresis so the O(pool) trim amortizes
+        # instead of firing every request once the pool saturates. NOTE the pool explodes at the
+        # train/eval boundary (i ~ n*train_frac): out-of-sample emissions have farther next-uses.
+        if self.maxpool > 0 and len(self.heap) > self.maxpool + max(self.maxpool // 4, 32):
+            kept = heapq.nsmallest(self.maxpool, self.heap)
             self.heap = [e for e in kept if e[1] in self.pending]
             heapq.heapify(self.heap)
             live = {x for _, x in self.heap}
@@ -265,7 +268,10 @@ def run(trace, cap, pos, szs, haz, args):
             print(f"  >> timing arm '{timing}' starting ({n:,} reqs)...", file=sys.stderr, flush=True)
         sch = CausalTimedCover(mk_wide(), pos, szs, haz, rate, budget, timing=timing,
                                gamma=args.gamma, lead=args.lead, max_wait=args.max_wait,
-                               maxpool=args.max_pool, verbose=args.verbose, n=n)
+                               # oracle = the construction check: must be exact, runs unbounded (it
+                               # never hung -- only the causal arms' due-storm needs the cap)
+                               maxpool=(0 if timing == "oracle" else args.max_pool),
+                               verbose=args.verbose, n=n)
         f7 = PFCache(cap, "s3fifo", sch, positions=pos, sizes=szs, pf_byte_rate=None).run(
             trace, cold_train_frac=tf, return_hits=True,
             progress=(f"F7:{timing}" if args.tqdm else None))
@@ -281,6 +287,9 @@ def run(trace, cap, pos, szs, haz, args):
             inv.append(f"cold hits {f7['pf_cold_hits']} != 0")
         if pfb > 1.02:
             inv.append(f"prefetch bytes {pfb:.2f}x of bar -- NOT iso-bandwidth")
+        if timing == "oracle" and not (np.isfinite(capf5) and capf5 >= 0.75):
+            inv.append(f"CONSTRUCTION CHECK: oracle-timing = {capf5:.0%} of F5 (expect ~100%) -- "
+                       f"harness broken; NOTHING in this run is reportable")
         okinv = "all pass" if not inv else "FAIL"
 
         tagd = "  (= F5 ceiling / construction check)" if timing == "oracle" else \
@@ -317,13 +326,24 @@ def run(trace, cap, pos, szs, haz, args):
         print(f"  CONSTRUCTION    oracle-timing = {oc_capf5:.0%} of F5 (the same-mechanics JIT ceiling)")
         print(f"  CAUSAL TIMING   model = {mcap:.0%} of the JIT ceiling ({mcap_f5:.0%} of F5) | "
               f"on-time {montime:.0%} | forecast-overshoot {movershoot:.0%}")
-        print(f"  CONFOUND        LATE {1-montime:.0%} vs forecast-overshoot {movershoot:.0%} -- the "
-              f"gap is bandwidth-queuing under the bar-sized bucket, NOT causal-timing error")
-        if montime >= 0.75 and mcap < 0.50:
+        mlate = 1.0 - montime
+        if mlate > movershoot:
+            print(f"  CONFOUND        LATE {mlate:.0%} vs forecast-overshoot {movershoot:.0%} -- the "
+                  f"gap is bandwidth-queuing under the bar-sized bucket, NOT causal-timing error")
+        else:
+            print(f"  CONFOUND        LATE {mlate:.0%} <= forecast-overshoot {movershoot:.0%} -- "
+                  f"overshot candidates were censored (cancelled/pruned/never afforded) before "
+                  f"funding; denominators differ (emissions vs funded)")
+        if not (np.isfinite(oc_capf5) and oc_capf5 >= 0.75):
+            pass                                   # verdict handled below: INVALID, no gate read
+        elif montime >= 0.75 and mcap < 0.50:
             print("  NOTE  on-time high but capture low -> fetches land BEFORE the use but the object is")
             print("        EVICTED before it (fetched too early). On real traces S(100)=1.0 this should not")
             print("        occur; if it does it is a survival problem, not timing overshoot -> raise --gamma.")
-        if mlo > 0 and mcap >= 0.50:
+        if not (np.isfinite(oc_capf5) and oc_capf5 >= 0.75):
+            v = ("INVALID -- the oracle arm did not reproduce F5 (construction check failed). "
+                 "Harness bug: fix and re-run before reading ANY verdict from this output.")
+        elif mlo > 0 and mcap >= 0.50:
             v = ("PASS -- causal JIT viable (>=50% of the JIT ceiling, CI>0). BUILD the full "
                  "DEFER-for-wide policy: the positive capture method.")
         elif mlo > 0:
@@ -376,12 +396,12 @@ def main():
     ap.add_argument("--lead", type=int, default=1)
     ap.add_argument("--max-wait", type=int, default=200_000)
     ap.add_argument("--max-pool", type=int, default=4096,
-                    help="cap on pending candidates held between requests -- the per-request "
-                         "drain/sort cost scales with it, so it is THE speed knob (drop to 1024/512 "
-                         "for faster runs, but only after a --max-pool sweep confirms capture and "
-                         "on-time/LATE are CI-stable). Keeps the smallest-size candidates == F7's "
-                         "smallest-first funding key; larger ones are displaced before they could be "
-                         "funded, so dropping them changes no funding decision.")
+                    help="cap on pending candidates in the CAUSAL arms only (model/point) -- the "
+                         "oracle arm always runs unbounded: it is the construction check and must "
+                         "be exact (a capped oracle froze spend at 0.52x and read -60% of F5). "
+                         "Keyed by SOONEST WAKE (the funding frontier), never by size. Sweep it "
+                         "(e.g. 4096 vs 16384) and quote a verdict only where capture and "
+                         "on-time/LATE are cap-stable.")
     ap.add_argument("--verbose", action="store_true",
                     help="clean newline progress every 200k reqs (% done, LATE rate, req/s, ETA). "
                          "Flush-safe and flicker-free -- use this for parallel runs.")
