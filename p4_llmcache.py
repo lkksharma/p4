@@ -103,12 +103,12 @@ class TurnGate:
     clairvoyant ceiling alike) -- the constraint is identical, so the corridor stays a fair
     like-for-like difference."""
 
-    QCAP = 256                                     # retained-queue bound (newest-first)
+    QCAP = 256                                     # retained-queue bound
 
     def __init__(self, base, turn_end):
         self.base, self.turn_end = base, turn_end
         self.name = f"turngate({getattr(base, 'name', '?')})"
-        self.pend, self.pset = [], set()
+        self.fresh, self.retained, self.pset = [], [], set()
 
     def set_params(self, k=None, tau=None):
         self.base.set_params(k=k, tau=tau)
@@ -118,27 +118,27 @@ class TurnGate:
         r = getattr(self.base, "reset", None)
         if r:
             r()
-        self.pend, self.pset = [], set()
+        self.fresh, self.retained, self.pset = [], [], set()
 
     def suggest(self, o, cached, i):
         for x in self.base.suggest(o, cached, i):
             if x not in self.pset:
-                self.pend.append(x)
+                self.fresh.append(x)
                 self.pset.add(x)
         if not self.turn_end[i]:
             return ()
-        # Release NEWEST-first at the boundary, and RETAIN what the token bucket cannot yet
-        # afford (PFCache admits a prefix of this list until tokens run out): dropping
-        # unadmitted candidates would starve the rate-limited ceiling arm of its own budget
-        # while the burst-capable bar loses nothing -- a measured -1.5pt inversion on the
-        # selftest. A real warming queue retains, so this is also the honest semantics.
-        # Cached candidates are pruned (demand-filled or already warmed); the queue is capped
-        # newest-first so stale never-affordable candidates age out instead of pinning memory.
-        out = [x for x in reversed(self.pend) if x not in cached]
+        # Release FRESH suggestions first (this request's calls, in their emitted order --
+        # for Prescient that is soonest-next-use first, the JIT-correct head), then retained
+        # older ones. RETAIN what the token bucket cannot yet afford (PFCache admits a prefix
+        # of this list until tokens run out): dropping unadmitted candidates starved the
+        # rate-limited ceiling arm of its own budget while the burst-capable bar lost nothing
+        # -- a measured -1.5pt inversion the selftest invariants caught. Cached candidates
+        # are pruned (demand-filled or already warmed); the queue is capped so stale
+        # never-affordable candidates age out instead of pinning memory.
+        out = [x for x in self.fresh + self.retained if x not in cached]
         if len(out) > self.QCAP:
             out = out[:self.QCAP]
-        self.pend = list(reversed(out))
-        self.pset = set(self.pend)
+        self.fresh, self.retained, self.pset = [], list(out), set(out)
         return out
 
 
@@ -255,6 +255,17 @@ def run(trace, args, name):
                   sizes=szs).run(trace, cold_train_frac=tf, return_hits=True)
     rate = bar["prefetch_bytes"] / max(n, 1)
 
+    # BAR-CAP -- the bar under the SAME token bucket the ceiling faces (HJS-L / Policy-1
+    # precedent). The bar bursts; the ceiling is rate-limited at the bar's average. On CDN
+    # the corridor dwarfed this protocol cost so the burst-vs-bucket asymmetry was safely
+    # conservative; here the corridor can be small enough that protocol cost flips the sign
+    # of a naive comparison (measured: it did). Corridor vs BAR stays the pre-registered
+    # headline; corridor vs BAR-CAP is the like-for-like scheduling comparison; the
+    # ceiling-validity invariant is checked against BAR-CAP (same protocol).
+    barcap = PFCache(cap, "s3fifo", gated[wname].set_params(k=wk, tau=wtau), positions=pos,
+                     sizes=szs, pf_byte_rate=rate).run(trace, cold_train_frac=tf,
+                                                       return_hits=True)
+
     # ---- LEARNABLE (= physical) CEILING: warm-Prescient, turn-gated, iso-BW ----
     # vocab = blocks seen in the training prefix: a block never yet computed+stored cannot be
     # warmed by ANY system, so this ceiling is not just budget-fair, it is physically maximal.
@@ -272,6 +283,10 @@ def run(trace, args, name):
     d = warm["hits_series"].astype(np.float64) - bar["hits_series"].astype(np.float64)
     lo, hi = block_ci(d, args.blocks, args.resamples, args.seed)
     pareto = warm["ohr"] > bar["ohr"] and warm_tx <= bar_tx + 0.01
+    protocol = 100.0 * (bar["ohr"] - barcap["ohr"])
+    corr_cap = 100.0 * (warm["ohr"] - barcap["ohr"])
+    dc = warm["hits_series"].astype(np.float64) - barcap["hits_series"].astype(np.float64)
+    clo, chi = block_ci(dc, args.blocks, args.resamples, args.seed)
 
     # ---- F2-lite: is the "when" learnable on the bar's own emission stream? ----
     class _H:
@@ -292,8 +307,9 @@ def run(trace, args, name):
         inv.append(f"bar cold hits {bar['pf_cold_hits']} != 0 -- history-based bar funding OOV")
     if warm["prefetch_bytes"] > 1.02 * max(bar["prefetch_bytes"], 1):
         inv.append("ceiling warming bytes exceed bar's -- NOT iso-bandwidth")
-    if warm["ohr"] < bar["ohr"] - 1e-9:
-        inv.append("ceiling below bar -- TurnGate or vocab wiring broken")
+    if warm["ohr"] < barcap["ohr"] - 1e-9:
+        inv.append("ceiling below BAR-CAP (same token bucket) -- clairvoyance losing under "
+                   "identical protocol: TurnGate or vocab wiring broken")
 
     # ------------------------------- THE TABLE -------------------------------
     gate = corridor >= 8.0 and lo > 0 and pareto
@@ -306,12 +322,17 @@ def run(trace, args, name):
           f"{'-':>10s} {'-':>6s}")
     print(f"  {'TUNED BAR ' + f'({wname} t{wtau} k{wk})':28s} {bar['ohr']:8.4f} "
           f"{bar_tx:8.2f} {bar['pf_issued']:>10,} {bar['pf_precision']:6.3f}")
+    print(f"  {'BAR-CAP (same bucket)':28s} {barcap['ohr']:8.4f} "
+          f"{barcap['origin_bytes'] / max(base_tx, 1):8.2f} {barcap['pf_issued']:>10,} "
+          f"{barcap['pf_precision']:6.3f}")
     print(f"  {'LEARNABLE CEILING (warm)':28s} {warm['ohr']:8.4f} {warm_tx:8.2f} "
           f"{warm['pf_issued']:>10,} {warm['pf_precision']:6.3f}")
     print(f"  {'-' * 96}")
-    print(f"  CORRIDOR {corridor:+.2f} pts   95% CI [{lo:+.2f},{hi:+.2f}]   "
+    print(f"  CORRIDOR vs BAR      {corridor:+.2f} pts   95% CI [{lo:+.2f},{hi:+.2f}]   "
           f"Pareto {'yes' if pareto else 'NO'}   [pre-registered gate >= 8, CI>0]   "
           f"-> {'EXISTS' if gate else 'below gate'}")
+    print(f"  CORRIDOR vs BAR-CAP  {corr_cap:+.2f} pts   95% CI [{clo:+.2f},{chi:+.2f}]   "
+          f"(like-for-like protocol)   PROTOCOL COST {protocol:+.2f} pts (bar burst vs bucket)")
     print(f"  F2-lite  Spearman {fm.get('rho', float('nan')):+.3f} [>=0.20]   "
           f"never-AUC {fm.get('never_auc', float('nan')):.3f} [>=0.60]   "
           f"S(100)={fm.get('s100', float('nan')):.3f}   "
