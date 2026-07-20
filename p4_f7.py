@@ -75,10 +75,11 @@ class CausalTimedCover:
     name = "f7"
 
     def __init__(self, base, pos, szs, haz, rate, budget, timing="model", gamma=0.5, lead=1,
-                 max_wait=200_000, verbose=False, n=0, vstep=200_000):
+                 max_wait=200_000, maxpool=4096, verbose=False, n=0, vstep=200_000):
         self.base, self.pos, self.szs = base, pos, szs
         self.rate, self.budget, self.timing = rate, budget, timing
         self.gamma, self.lead, self.max_wait = gamma, lead, max_wait
+        self.maxpool = maxpool
         self.verbose, self.n, self.vstep, self.t_start = verbose, n, vstep, None
         hist = haz["hist"]
         self.woff = np.zeros((N_REC, N_FREQ, N_CONF))     # gamma-quantile lag per (rec,freq,conf) bin
@@ -92,12 +93,14 @@ class CausalTimedCover:
         self.pending, self.heap = {}, []                  # obj -> (size, true_use, emit_time); heap (wake, obj)
         self.tokens = self.spent = 0.0
         self.on_time = self.late = 0
+        self.wake_over = self.wake_early = 0               # forecast-overshoot instrumentation
 
     def reset(self):
         self.last_seen, self.freq = {}, {}
-        self.pending, self.heap, self._heap_size = {}, [], 0
+        self.pending, self.heap = {}, []
         self.tokens = self.spent = 0.0
         self.on_time = self.late = 0
+        self.wake_over = self.wake_early = 0
         self.t_start = time.time()
         r = getattr(self.base, "reset", None)
         if r:
@@ -113,7 +116,8 @@ class CausalTimedCover:
             eta = (self.n - i) / rt / 60.0 if rt > 0 else 0.0
             tot = max(self.on_time + self.late, 1)
             print(f"    [{self.timing:6s}] {i:>9,}/{self.n:,} ({i/max(self.n,1):4.0%}) | "
-                  f"LATE {self.late/tot:4.0%} | spent {self.spent/max(self.budget,1):.2f}x | "
+                  f"LATE {self.late/tot:4.0%} | pool {len(self.heap):>6,} | "
+                  f"spent {self.spent/max(self.budget,1):.2f}x | "
                   f"{rt:>5.0f} req/s | ETA {eta:4.0f}m", file=sys.stderr, flush=True)
 
         # (1) harvest wide emissions; CLAIRVOYANT selection (fund iff used again) + timed wake
@@ -143,6 +147,14 @@ class CausalTimedCover:
                 wake = max(wake, i)
                 if wake > i + self.max_wait:               # discard if wake is too far in the future
                     continue
+                # de-confounding instrumentation (ZERO funding impact): did the FORECAST wake itself
+                # land after the true use? At low gamma nearly every wake is early, so a high LATE that
+                # is NOT matched by a high overshoot rate is bandwidth-queuing under the bar-sized token
+                # bucket, NOT causal-timing error -- the paper must not conflate the two.
+                if wake > int(nx):
+                    self.wake_over += 1
+                else:
+                    self.wake_early += 1
                 self.pending[x] = (s, int(nx), i)          # track emit_time for staleness checks
                 heapq.heappush(self.heap, (wake, x))
         self.last_seen[o] = i
@@ -192,6 +204,24 @@ class CausalTimedCover:
             else:                                          # inserted AFTER the use -> LATE (a miss)
                 self.late += 1
             out.append(x)
+
+        # (3) BOUND THE POOL -- keep only the maxpool SMALLEST-size candidates carried between
+        # requests (Policy 1's WideMarket cap, p4_policy1.py:177-183, re-keyed to F7's funding key).
+        # F7 funds smallest-first (due.sort above), so under the wide net's heavy oversubscription a
+        # candidate larger than the maxpool smallest is perpetually outranked by fresher smaller ones
+        # and ages out unfunded -- dropping it changes no funding decision (confirm with a --max-pool
+        # sweep). Keyed by SIZE, never by wake (all wakes collapse to ~i at low gamma, so wake cannot
+        # discriminate) nor by true-use nx (that would leak clairvoyance into the causal arm's pool
+        # management). At end-of-request every live pending item has exactly one heap entry, so pruning
+        # the heap by size and rebuilding pending from the survivors bounds BOTH structures.
+        if len(self.heap) > self.maxpool:
+            kept = heapq.nsmallest(
+                self.maxpool, self.heap,
+                key=lambda e: self.pending[e[1]][0] if e[1] in self.pending else float("inf"))
+            self.heap = [e for e in kept if e[1] in self.pending]
+            heapq.heapify(self.heap)
+            live = {x for _, x in self.heap}
+            self.pending = {x: v for x, v in self.pending.items() if x in live}
         return out
 
 
@@ -235,7 +265,7 @@ def run(trace, cap, pos, szs, haz, args):
             print(f"  >> timing arm '{timing}' starting ({n:,} reqs)...", file=sys.stderr, flush=True)
         sch = CausalTimedCover(mk_wide(), pos, szs, haz, rate, budget, timing=timing,
                                gamma=args.gamma, lead=args.lead, max_wait=args.max_wait,
-                               verbose=args.verbose, n=n)
+                               maxpool=args.max_pool, verbose=args.verbose, n=n)
         f7 = PFCache(cap, "s3fifo", sch, positions=pos, sizes=szs, pf_byte_rate=None).run(
             trace, cold_train_frac=tf, return_hits=True,
             progress=(f"F7:{timing}" if args.tqdm else None))
@@ -258,28 +288,37 @@ def run(trace, cap, pos, szs, haz, args):
         print(f"  [{timing:6s}] OHR {f7['ohr']:.4f}   pf {f7['pf_issued']:,} "
               f"useful {f7['pf_useful']:,} (prec {f7['pf_precision']:.3f})   spent "
               f"{sch.spent/max(budget,1):.2f}x{tagd}")
+        wtot = max(sch.wake_over + sch.wake_early, 1)
+        overshoot = sch.wake_over / wtot
         print(f"           on-time {sch.on_time:,} ({sch.on_time/tot:.1%})   LATE {sch.late:,} "
-              f"({sch.late/tot:.1%})")
+              f"({sch.late/tot:.1%})   forecast-overshoot {overshoot:.1%} (wake > true use at emission)")
         print(f"           corridor {f7_corr:+.2f} [{lo:+.2f},{hi:+.2f}]   capture {capf5:.1%} of F5 "
               f"| pf bytes {pfb:.2f}x   inv:{okinv}")
         if timing == "model" and sch.late / tot > 0.25:
-            print("           -> LATE dominates: the causal wake overshoots the use. Lower --gamma "
-                  "(fetch earlier). If LATE stays high across gamma, causal timing is the wall.")
+            if sch.late / tot - overshoot > 0.25:
+                print("           -> LATE >> forecast-overshoot: the LATE is BANDWIDTH-QUEUING (the "
+                      "bar-sized bucket cannot drain the wide net's bunched demand), NOT timing error. "
+                      "Do NOT read this as 'causal timing is the wall' -- report the confound.")
+            else:
+                print("           -> LATE tracks forecast-overshoot: the causal wake genuinely "
+                      "overshoots the use. Lower --gamma (fetch earlier) and re-check.")
         for m in inv:
             print(f"           !! {m}")
-        results[timing] = (f7_corr, lo, hi, capf5, sch.on_time / tot)
+        results[timing] = (f7_corr, lo, hi, capf5, sch.on_time / tot, overshoot)
 
     # verdict -- the clean comparison is model-vs-ORACLE (same F7 mechanics, only the wake clock
     # differs), which isolates timing accuracy. F5 is reported for continuity but F7-oracle is the
     # correct same-mechanics JIT ceiling (it need not equal F5 -- different object selection).
     if "model" in results and "oracle" in results:
-        mc, mlo, mhi, mcap_f5, montime = results["model"]
-        oc_corr, _, _, oc_capf5, _ = results["oracle"]
+        mc, mlo, mhi, mcap_f5, montime, movershoot = results["model"]
+        oc_corr, _, _, oc_capf5, _, _ = results["oracle"]
         mcap = mc / oc_corr if oc_corr > 0 else float("nan")   # model capture of the JIT ceiling
         print(f"  {'-'*78}")
         print(f"  CONSTRUCTION    oracle-timing = {oc_capf5:.0%} of F5 (the same-mechanics JIT ceiling)")
         print(f"  CAUSAL TIMING   model = {mcap:.0%} of the JIT ceiling ({mcap_f5:.0%} of F5) | "
-              f"on-time {montime:.0%}")
+              f"on-time {montime:.0%} | forecast-overshoot {movershoot:.0%}")
+        print(f"  CONFOUND        LATE {1-montime:.0%} vs forecast-overshoot {movershoot:.0%} -- the "
+              f"gap is bandwidth-queuing under the bar-sized bucket, NOT causal-timing error")
         if montime >= 0.75 and mcap < 0.50:
             print("  NOTE  on-time high but capture low -> fetches land BEFORE the use but the object is")
             print("        EVICTED before it (fetched too early). On real traces S(100)=1.0 this should not")
@@ -304,7 +343,7 @@ def selftest():
         trace = "SYNTH"; limit = 60000; cache_frac = 0.01; pred = "markov1"; tau = 0.05; k = 1
         window = 16; train_frac = 0.5; haz_frac = 0.75; horizon = 5000; out = "/tmp/_f7_haz.npz"
         wide_k = 16; wide_tau = 0.0; wide_top_m = 16; timings = ["oracle", "model", "point"]
-        gamma = 0.25; lead = 1; max_wait = 20000; verbose = False; tqdm = False
+        gamma = 0.25; lead = 1; max_wait = 20000; max_pool = 4096; verbose = False; tqdm = False
         blocks = 100; resamples = 500; seed = 0
     a = A()
     trace, cap, pos, szs = prep("SYNTH", a.limit, a.cache_frac)
@@ -336,6 +375,13 @@ def main():
                          "LATE, costs occupancy); HIGH = fetch late and miss. THE knob to sweep.")
     ap.add_argument("--lead", type=int, default=1)
     ap.add_argument("--max-wait", type=int, default=200_000)
+    ap.add_argument("--max-pool", type=int, default=4096,
+                    help="cap on pending candidates held between requests -- the per-request "
+                         "drain/sort cost scales with it, so it is THE speed knob (drop to 1024/512 "
+                         "for faster runs, but only after a --max-pool sweep confirms capture and "
+                         "on-time/LATE are CI-stable). Keeps the smallest-size candidates == F7's "
+                         "smallest-first funding key; larger ones are displaced before they could be "
+                         "funded, so dropping them changes no funding decision.")
     ap.add_argument("--verbose", action="store_true",
                     help="clean newline progress every 200k reqs (% done, LATE rate, req/s, ETA). "
                          "Flush-safe and flicker-free -- use this for parallel runs.")
