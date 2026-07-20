@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""p4_f7.py -- the JIT-REALIZABILITY gate: the final rung of the capture ladder.
+
+Where the ladder stands:
+  * F5        : wide emission + clairvoyant JIT + clairvoyant selection = +10 to +11 (the corridor
+                IS reachable in principle).
+  * Policy 1  : wide emission + AT-EMISSION captures <=6% of it, even with a perfect forecaster using
+                F5's OWN selection -> JIT insertion is the missing ingredient (clean, audited).
+  * Open      : is causal USE-LAG prediction accurate enough to PLACE the JIT insertion, or does it
+                overshoot (LATE) the way HJS-L's k=1 defer did (55% LATE on real traces)?
+
+F7 isolates exactly that and nothing else. It keeps F5's clairvoyant coverage AND selection -- it
+funds ONLY objects that will actually be used again (the "which" is guaranteed right) -- and varies
+only WHEN the fetch is inserted:
+
+    timing=oracle : wake = true_next_use - lead          (= F5 itself; the JIT ceiling / construction check)
+    timing=model  : wake = emission + hazard_lag(gamma) - lead   (the causal use-lag forecast -- THE test)
+    timing=point  : wake = emission + hazard_median - lead       (median only; does the shape matter?)
+
+So oracle-vs-model is a PURE timing-accuracy comparison: same objects, same budget, only the wake
+clock differs. LATE = the wake landed AFTER the use (a total loss); on-time = before it.
+
+PRE-REGISTERED GATE: timing=model captures >= 50% of F5's corridor, bootstrap CI excluding zero, on
+a live trace. Below 50% the on-time rate is too low for a deployable scheduler.
+  PASS -> causal JIT is viable -> build the full DEFER-for-wide policy (the positive capture method).
+  FAIL -> the corridor is reachable only by CLAIRVOYANT timing; no causal policy captures it (the
+          clean negative -- the measurement half of the paper carries it).
+
+    python p4_f7.py --trace data/wiki_2019t.oracleGeneral --pred markov2 --tau 0.05 --k 1 \
+        --wide-k 32 --wide-top-m 32 --haz haz/wiki.npz
+    python p4_f7.py --selftest
+"""
+from __future__ import annotations
+
+import argparse
+import heapq
+
+import numpy as np
+
+from p4_cache import NEVER
+from p4_coldsplit import PREDS
+from p4_f4 import capture_ctx, conf_lookup
+from p4_f5 import CoverGatedPrescient, build_coverable
+from p4_hazard import (LAG_EDGES, N_CONF, N_FREQ, N_REC, conf_bin, freq_bin, recency_bin,
+                       run as haz_run)
+from p4_prefetch import PFCache, oracle_next
+from p4_sweep import KS, prep
+
+
+def block_ci(diff, blocks, resamples, seed):
+    R = len(diff); L = R // blocks
+    bm = diff[:blocks * L].reshape(blocks, L).mean(axis=1)
+    rng = np.random.default_rng(seed)
+    boot = 100.0 * bm[rng.integers(0, blocks, size=(resamples, blocks))].mean(axis=1)
+    return np.percentile(boot, [2.5, 97.5])
+
+
+def _quantile(row, g):
+    """Lag at the g-quantile of the conditional (used) lag distribution, at the bin's LOWER edge
+    (same convention as HJS-L: log bins are wide and uses cluster near the low end, so the midpoint
+    systematically overshoots -> LATE)."""
+    f = row[:16]
+    tot = f.sum()
+    if tot <= 0:
+        return float(LAG_EDGES[0])
+    cdf = np.cumsum(f / tot)
+    return float(LAG_EDGES[min(int(np.searchsorted(cdf, g)), 15)])
+
+
+class CausalTimedCover:
+    """F5's clairvoyant coverage + selection, with causal-vs-oracle TIMING. Funds only objects that
+    WILL be used again (clairvoyant 'which'), inserts at a wake time set by the timing mode. The
+    single free variable across arms is the wake clock -> oracle-vs-model isolates timing accuracy."""
+    name = "f7"
+
+    def __init__(self, base, pos, szs, haz, rate, budget, timing="model", gamma=0.5, lead=1,
+                 max_wait=200_000):
+        self.base, self.pos, self.szs = base, pos, szs
+        self.rate, self.budget, self.timing = rate, budget, timing
+        self.gamma, self.lead, self.max_wait = gamma, lead, max_wait
+        hist = haz["hist"]
+        self.woff = np.zeros((N_REC, N_FREQ, N_CONF))     # gamma-quantile lag per (rec,freq,conf) bin
+        self.wmed = np.zeros((N_REC, N_FREQ, N_CONF))     # median lag, for the 'point' arm
+        for a in range(N_REC):
+            for b in range(N_FREQ):
+                for d in range(N_CONF):
+                    self.woff[a, b, d] = _quantile(hist[a, b, d], gamma)
+                    self.wmed[a, b, d] = _quantile(hist[a, b, d], 0.5)
+        self.last_seen, self.freq = {}, {}
+        self.pending, self.heap = {}, []                  # obj -> (size, true_use); heap (wake, obj)
+        self.tokens = self.spent = 0.0
+        self.on_time = self.late = 0
+
+    def reset(self):
+        self.last_seen, self.freq = {}, {}
+        self.pending, self.heap = {}, []
+        self.tokens = self.spent = 0.0
+        self.on_time = self.late = 0
+        r = getattr(self.base, "reset", None)
+        if r:
+            r()
+
+    def suggest(self, o, cached, i):
+        self.tokens += self.rate
+
+        # (1) harvest wide emissions; CLAIRVOYANT selection (fund iff used again) + timed wake
+        ctx = capture_ctx(self.base)
+        objs = self.base.suggest(o, cached, i)
+        if objs:
+            cmap = conf_lookup(self.base, ctx, o)
+            tau = getattr(self.base, "tau", 0.05)
+            for x in objs:
+                x = int(x)
+                if x in self.pending or x in cached:
+                    continue
+                s = self.szs.get(x)
+                if s is None or s > self.budget:
+                    continue
+                nx = oracle_next(self.pos, x, i)
+                if nx >= int(NEVER):                       # clairvoyant selection: never fund never-used
+                    continue
+                if self.timing == "oracle":
+                    wake = int(nx) - self.lead             # = F5: fetch just before the true use
+                else:
+                    rb = recency_bin(i - self.last_seen[x] if x in self.last_seen else -1)
+                    fb = freq_bin(self.freq.get(x, 0))
+                    cb = conf_bin(cmap.get(x, tau))
+                    off = self.wmed[rb, fb, cb] if self.timing == "point" else self.woff[rb, fb, cb]
+                    wake = int(i + off - self.lead)        # causal: fetch at predicted use time
+                self.pending[x] = (s, int(nx))
+                heapq.heappush(self.heap, (max(wake, i), x))
+        self.last_seen[o] = i
+        self.freq[o] = self.freq.get(o, 0) + 1
+
+        # (2) collect due candidates (wake reached), fund smallest-first within the rate token bucket
+        due = []
+        while self.heap and self.heap[0][0] <= i:
+            _, x = heapq.heappop(self.heap)
+            info = self.pending.get(x)
+            if info is None:
+                continue                                   # already handled
+            s, nx = info
+            if x in cached:                                # demand-filled while pending -> cancel
+                self.pending.pop(x, None); continue
+            due.append((s, x, nx))
+        due.sort()                                         # smallest-first (head-of-line safety)
+        out = []
+        for s, x, nx in due:
+            if self.tokens < s or self.spent + s > self.budget:
+                heapq.heappush(self.heap, (i + 1, x))      # can't afford now -> wait for tokens
+                continue
+            self.tokens -= s; self.spent += s
+            self.pending.pop(x, None)
+            if i <= nx:                                    # inserted BEFORE the use -> on-time
+                self.on_time += 1
+            else:                                          # inserted AFTER the use -> LATE (a miss)
+                self.late += 1
+            out.append(x)
+        return out
+
+
+def run(trace, cap, pos, szs, haz, args):
+    tf = args.train_frac
+    n = trace["n"]
+    kw = args.wide_k
+
+    def mk():
+        return PREDS[args.pred](trace, train_frac=tf, window=args.window, k=args.k, tau=args.tau)
+
+    def mk_wide():
+        p = PREDS[args.pred](trace, train_frac=tf, window=args.window, k=args.k, tau=args.tau,
+                             top_m=args.wide_top_m)
+        p.k, p.tau = kw, args.wide_tau
+        return p
+
+    base = PFCache(cap, "s3fifo", None, positions=pos, sizes=szs).run(trace)
+    bar = PFCache(cap, "s3fifo", mk(), positions=pos, sizes=szs).run(
+        trace, cold_train_frac=tf, return_hits=True)
+    rate = bar["prefetch_bytes"] / max(n, 1)
+    budget = bar["prefetch_bytes"]
+
+    # F5 ceiling (wide + clairvoyant JIT) -- the denominator.
+    coverable, n_cov = build_coverable(mk_wide(), trace, kw, args.wide_tau)
+    f5 = PFCache(cap, "s3fifo", CoverGatedPrescient(trace, coverable, k=max(KS), lookahead=2000),
+                 positions=pos, sizes=szs, pf_byte_rate=rate).run(trace, cold_train_frac=tf)
+    f5_corr = 100.0 * (f5["ohr"] - bar["ohr"])
+
+    print(f"\n  {args.trace}   [F7 JIT-realizability | k_wide={kw} gamma={args.gamma}]")
+    print(f"  BAR       OHR {bar['ohr']:.4f}   pf {bar['pf_issued']:,} (prec {bar['pf_precision']:.3f})")
+    print(f"  F5 CEIL   OHR {f5['ohr']:.4f}   corridor {f5_corr:+.2f} pts   (coverage {n_cov/n:.1%}) "
+          f"<- the denominator (wide + PERFECT JIT)")
+    print(f"  {'-'*78}")
+
+    results = {}
+    for timing in args.timings:
+        sch = CausalTimedCover(mk_wide(), pos, szs, haz, rate, budget, timing=timing,
+                               gamma=args.gamma, lead=args.lead, max_wait=args.max_wait)
+        f7 = PFCache(cap, "s3fifo", sch, positions=pos, sizes=szs, pf_byte_rate=None).run(
+            trace, cold_train_frac=tf, return_hits=True)
+        f7_corr = 100.0 * (f7["ohr"] - bar["ohr"])
+        capf5 = f7_corr / f5_corr if f5_corr > 0 else float("nan")
+        pfb = f7["prefetch_bytes"] / max(bar["prefetch_bytes"], 1)
+        tot = max(sch.on_time + sch.late, 1)
+        d = f7["hits_series"].astype(np.float64) - bar["hits_series"].astype(np.float64)
+        lo, hi = block_ci(d, args.blocks, args.resamples, args.seed)
+
+        inv = []
+        if f7["pf_cold_hits"] != 0:
+            inv.append(f"cold hits {f7['pf_cold_hits']} != 0")
+        if pfb > 1.02:
+            inv.append(f"prefetch bytes {pfb:.2f}x of bar -- NOT iso-bandwidth")
+        okinv = "all pass" if not inv else "FAIL"
+
+        tagd = "  (= F5 ceiling / construction check)" if timing == "oracle" else \
+               "  (DIAGNOSTIC)" if timing == "point" else ""
+        print(f"  [{timing:6s}] OHR {f7['ohr']:.4f}   pf {f7['pf_issued']:,} "
+              f"useful {f7['pf_useful']:,} (prec {f7['pf_precision']:.3f})   spent "
+              f"{sch.spent/max(budget,1):.2f}x{tagd}")
+        print(f"           on-time {sch.on_time:,} ({sch.on_time/tot:.1%})   LATE {sch.late:,} "
+              f"({sch.late/tot:.1%})")
+        print(f"           corridor {f7_corr:+.2f} [{lo:+.2f},{hi:+.2f}]   capture {capf5:.1%} of F5 "
+              f"| pf bytes {pfb:.2f}x   inv:{okinv}")
+        if timing == "model" and sch.late / tot > 0.25:
+            print("           -> LATE dominates: the causal wake overshoots the use. Lower --gamma "
+                  "(fetch earlier). If LATE stays high across gamma, causal timing is the wall.")
+        for m in inv:
+            print(f"           !! {m}")
+        results[timing] = (f7_corr, lo, hi, capf5, sch.on_time / tot)
+
+    # verdict -- the clean comparison is model-vs-ORACLE (same F7 mechanics, only the wake clock
+    # differs), which isolates timing accuracy. F5 is reported for continuity but F7-oracle is the
+    # correct same-mechanics JIT ceiling (it need not equal F5 -- different object selection).
+    if "model" in results and "oracle" in results:
+        mc, mlo, mhi, mcap_f5, montime = results["model"]
+        oc_corr, _, _, oc_capf5, _ = results["oracle"]
+        mcap = mc / oc_corr if oc_corr > 0 else float("nan")   # model capture of the JIT ceiling
+        print(f"  {'-'*78}")
+        print(f"  CONSTRUCTION    oracle-timing = {oc_capf5:.0%} of F5 (the same-mechanics JIT ceiling)")
+        print(f"  CAUSAL TIMING   model = {mcap:.0%} of the JIT ceiling ({mcap_f5:.0%} of F5) | "
+              f"on-time {montime:.0%}")
+        if montime >= 0.75 and mcap < 0.50:
+            print("  NOTE  on-time high but capture low -> fetches land BEFORE the use but the object is")
+            print("        EVICTED before it (fetched too early). On real traces S(100)=1.0 this should not")
+            print("        occur; if it does it is a survival problem, not timing overshoot -> raise --gamma.")
+        if mlo > 0 and mcap >= 0.50:
+            v = ("PASS -- causal JIT viable (>=50% of the JIT ceiling, CI>0). BUILD the full "
+                 "DEFER-for-wide policy: the positive capture method.")
+        elif mlo > 0:
+            v = (f"POSITIVE but below the 50% bar ({mcap:.0%}). Sweep --gamma; if it tops out here, "
+                 "causal timing is partial -- a weak positive, not the headline.")
+        else:
+            v = ("FAIL -- causal use-lag timing cannot place the JIT insertion (CI includes 0). The "
+                 "corridor needs CLAIRVOYANT timing; no causal policy captures it -- the measurement "
+                 "half carries the paper, plus the Necessity-Ladder triple-kill.")
+        print(f"  GATE (>=50% ceiling)  {v}")
+    print()
+    return results
+
+
+def selftest():
+    class A:
+        trace = "SYNTH"; limit = 60000; cache_frac = 0.01; pred = "markov1"; tau = 0.05; k = 1
+        window = 16; train_frac = 0.5; haz_frac = 0.75; horizon = 5000; out = "/tmp/_f7_haz.npz"
+        wide_k = 16; wide_tau = 0.0; wide_top_m = 16; timings = ["oracle", "model", "point"]
+        gamma = 0.25; lead = 1; max_wait = 20000; blocks = 100; resamples = 500; seed = 0
+    a = A()
+    trace, cap, pos, szs = prep("SYNTH", a.limit, a.cache_frac)
+    haz_run(trace, cap, pos, szs, a)                       # writes /tmp/_f7_haz.npz
+    haz = np.load(a.out)
+    run(trace, cap, pos, szs, haz, a)
+    print("  [p4_f7 selftest] completed without error\n")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="F7 JIT-realizability gate (final capture-ladder rung)")
+    ap.add_argument("--trace")
+    ap.add_argument("--limit", type=int, default=2_000_000)
+    ap.add_argument("--cache-frac", type=float, default=0.01)
+    ap.add_argument("--pred", choices=sorted(PREDS))
+    ap.add_argument("--tau", type=float)
+    ap.add_argument("--k", type=int)
+    ap.add_argument("--window", type=int, default=16)
+    ap.add_argument("--train-frac", type=float, default=0.5)
+    ap.add_argument("--haz", help="hazard+survival .npz from p4_hazard.py (the use-lag model)")
+    ap.add_argument("--wide-k", type=int, default=16, help="emission fanout (the F5-cleared width)")
+    ap.add_argument("--wide-tau", type=float, default=0.0)
+    ap.add_argument("--wide-top-m", type=int, default=16)
+    ap.add_argument("--timings", default="oracle,model,point",
+                    help="oracle (=F5 ceiling/construction check), model (causal use-lag -- the test), "
+                         "point (median only)")
+    ap.add_argument("--gamma", type=float, default=0.25,
+                    help="use-lag quantile the causal wake targets. LOW = fetch EARLY (safe against "
+                         "LATE, costs occupancy); HIGH = fetch late and miss. THE knob to sweep.")
+    ap.add_argument("--lead", type=int, default=1)
+    ap.add_argument("--max-wait", type=int, default=200_000)
+    ap.add_argument("--blocks", type=int, default=1000)
+    ap.add_argument("--resamples", type=int, default=10000)
+    ap.add_argument("--seed", type=int, default=0)
+    args = ap.parse_args()
+    if not (args.trace and args.pred and args.tau is not None and args.k is not None and args.haz):
+        ap.error("need --trace --pred --tau --k --haz")
+    args.timings = [t for t in str(args.timings).split(",") if t.strip()]
+    trace, cap, pos, szs = prep(args.trace, args.limit, args.cache_frac)
+    haz = np.load(args.haz)
+    run(trace, cap, pos, szs, haz, args)
+
+
+if __name__ == "__main__":
+    import sys
+    if "--selftest" in sys.argv:
+        selftest()
+    else:
+        main()
