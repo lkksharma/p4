@@ -226,9 +226,13 @@ def run(trace, cap, pos, szs, args):
     # flips sign between the windows, and a model fit on the first is anti-predictive on the second
     # (never-AUC lands BELOW 0.5, the signature of exactly this bug rather than of a weak model).
     # The hazard model must see the predictor as it will actually behave at deployment: unseen data.
+    import sys
+    print(f"  [hazard] harvesting train window [{cut:,},{hcut:,}) -- full-trace replay, silent, "
+          f"~10-25 min at wide k...", file=sys.stderr, flush=True)
     r_tr, f_tr, c_tr, s_tr, l_tr = harvest(mk(), trace, cut, hcut, szs, pos, H)
     hist = build_hazard(r_tr, f_tr, c_tr, l_tr)
 
+    print(f"  [hazard] harvesting eval window [{hcut:,},{n:,})...", file=sys.stderr, flush=True)
     r_ev, f_ev, c_ev, s_ev, l_ev = harvest(mk(), trace, hcut, n, szs, pos, H)
     used = l_ev >= 0
     pred_med = np.array([median_lag_pred(hist[recency_bin(int(r)), freq_bin(int(f)), conf_bin(c)])
@@ -239,6 +243,7 @@ def run(trace, cap, pos, szs, args):
     never_auc = auc(p_never, (~used).astype(int))
 
     # ---- survival curve S(delta): instrumented bar replay over the full trace ----
+    print("  [hazard] survival replay...", file=sys.stderr, flush=True)
     barrun = PFCache(cap, "s3fifo", mk(), positions=pos, sizes=szs).run(
         trace, cold_train_frac=tf, record_survival=True)
     surv = barrun["pf_survival"]

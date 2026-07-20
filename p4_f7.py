@@ -242,6 +242,10 @@ def run(trace, cap, pos, szs, haz, args):
         p.k, p.tau = kw, args.wide_tau
         return p
 
+    if args.verbose:
+        import sys
+        print("  [prelude] base + bar replays (silent, a few minutes)...",
+              file=sys.stderr, flush=True)
     base = PFCache(cap, "s3fifo", None, positions=pos, sizes=szs).run(trace)
     bar = PFCache(cap, "s3fifo", mk(), positions=pos, sizes=szs).run(
         trace, cold_train_frac=tf, return_hits=True)
@@ -249,6 +253,10 @@ def run(trace, cap, pos, szs, haz, args):
     budget = bar["prefetch_bytes"]
 
     # F5 ceiling (wide + clairvoyant JIT) -- the denominator.
+    if args.verbose:
+        import sys
+        print(f"  [prelude] coverable set + F5 ceiling replay (wide k={kw}) -- the SLOW, SILENT "
+              f"part, ~10-25 min on 2M reqs; not a hang...", file=sys.stderr, flush=True)
     coverable, n_cov = build_coverable(mk_wide(), trace, kw, args.wide_tau)
     f5 = PFCache(cap, "s3fifo", CoverGatedPrescient(trace, coverable, k=max(KS), lookahead=2000),
                  positions=pos, sizes=szs, pf_byte_rate=rate).run(
