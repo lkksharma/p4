@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import heapq
+import time
 
 import numpy as np
 
@@ -74,10 +75,11 @@ class CausalTimedCover:
     name = "f7"
 
     def __init__(self, base, pos, szs, haz, rate, budget, timing="model", gamma=0.5, lead=1,
-                 max_wait=200_000):
+                 max_wait=200_000, verbose=False, n=0, vstep=200_000):
         self.base, self.pos, self.szs = base, pos, szs
         self.rate, self.budget, self.timing = rate, budget, timing
         self.gamma, self.lead, self.max_wait = gamma, lead, max_wait
+        self.verbose, self.n, self.vstep, self.t_start = verbose, n, vstep, None
         hist = haz["hist"]
         self.woff = np.zeros((N_REC, N_FREQ, N_CONF))     # gamma-quantile lag per (rec,freq,conf) bin
         self.wmed = np.zeros((N_REC, N_FREQ, N_CONF))     # median lag, for the 'point' arm
@@ -96,12 +98,23 @@ class CausalTimedCover:
         self.pending, self.heap = {}, []
         self.tokens = self.spent = 0.0
         self.on_time = self.late = 0
+        self.t_start = time.time()
         r = getattr(self.base, "reset", None)
         if r:
             r()
 
     def suggest(self, o, cached, i):
         self.tokens += self.rate
+
+        if self.verbose and i and i % self.vstep == 0:
+            import sys
+            el = time.time() - (self.t_start or time.time())
+            rt = i / el if el > 0 else 0.0
+            eta = (self.n - i) / rt / 60.0 if rt > 0 else 0.0
+            tot = max(self.on_time + self.late, 1)
+            print(f"    [{self.timing:6s}] {i:>9,}/{self.n:,} ({i/max(self.n,1):4.0%}) | "
+                  f"LATE {self.late/tot:4.0%} | spent {self.spent/max(self.budget,1):.2f}x | "
+                  f"{rt:>5.0f} req/s | ETA {eta:4.0f}m", file=sys.stderr, flush=True)
 
         # (1) harvest wide emissions; CLAIRVOYANT selection (fund iff used again) + timed wake
         ctx = capture_ctx(self.base)
@@ -182,7 +195,8 @@ def run(trace, cap, pos, szs, haz, args):
     # F5 ceiling (wide + clairvoyant JIT) -- the denominator.
     coverable, n_cov = build_coverable(mk_wide(), trace, kw, args.wide_tau)
     f5 = PFCache(cap, "s3fifo", CoverGatedPrescient(trace, coverable, k=max(KS), lookahead=2000),
-                 positions=pos, sizes=szs, pf_byte_rate=rate).run(trace, cold_train_frac=tf)
+                 positions=pos, sizes=szs, pf_byte_rate=rate).run(
+        trace, cold_train_frac=tf, progress=("F5-ceiling" if args.tqdm else None))
     f5_corr = 100.0 * (f5["ohr"] - bar["ohr"])
 
     print(f"\n  {args.trace}   [F7 JIT-realizability | k_wide={kw} gamma={args.gamma}]")
@@ -193,10 +207,15 @@ def run(trace, cap, pos, szs, haz, args):
 
     results = {}
     for timing in args.timings:
+        if args.verbose:
+            import sys
+            print(f"  >> timing arm '{timing}' starting ({n:,} reqs)...", file=sys.stderr, flush=True)
         sch = CausalTimedCover(mk_wide(), pos, szs, haz, rate, budget, timing=timing,
-                               gamma=args.gamma, lead=args.lead, max_wait=args.max_wait)
+                               gamma=args.gamma, lead=args.lead, max_wait=args.max_wait,
+                               verbose=args.verbose, n=n)
         f7 = PFCache(cap, "s3fifo", sch, positions=pos, sizes=szs, pf_byte_rate=None).run(
-            trace, cold_train_frac=tf, return_hits=True)
+            trace, cold_train_frac=tf, return_hits=True,
+            progress=(f"F7:{timing}" if args.tqdm else None))
         f7_corr = 100.0 * (f7["ohr"] - bar["ohr"])
         capf5 = f7_corr / f5_corr if f5_corr > 0 else float("nan")
         pfb = f7["prefetch_bytes"] / max(bar["prefetch_bytes"], 1)
@@ -262,7 +281,8 @@ def selftest():
         trace = "SYNTH"; limit = 60000; cache_frac = 0.01; pred = "markov1"; tau = 0.05; k = 1
         window = 16; train_frac = 0.5; haz_frac = 0.75; horizon = 5000; out = "/tmp/_f7_haz.npz"
         wide_k = 16; wide_tau = 0.0; wide_top_m = 16; timings = ["oracle", "model", "point"]
-        gamma = 0.25; lead = 1; max_wait = 20000; blocks = 100; resamples = 500; seed = 0
+        gamma = 0.25; lead = 1; max_wait = 20000; verbose = False; tqdm = False
+        blocks = 100; resamples = 500; seed = 0
     a = A()
     trace, cap, pos, szs = prep("SYNTH", a.limit, a.cache_frac)
     haz_run(trace, cap, pos, szs, a)                       # writes /tmp/_f7_haz.npz
@@ -293,6 +313,11 @@ def main():
                          "LATE, costs occupancy); HIGH = fetch late and miss. THE knob to sweep.")
     ap.add_argument("--lead", type=int, default=1)
     ap.add_argument("--max-wait", type=int, default=200_000)
+    ap.add_argument("--verbose", action="store_true",
+                    help="clean newline progress every 200k reqs (% done, LATE rate, req/s, ETA). "
+                         "Flush-safe and flicker-free -- use this for parallel runs.")
+    ap.add_argument("--tqdm", action="store_true",
+                    help="live tqdm bar per replay. Avoid with parallel runs (bars flicker).")
     ap.add_argument("--blocks", type=int, default=1000)
     ap.add_argument("--resamples", type=int, default=10000)
     ap.add_argument("--seed", type=int, default=0)
