@@ -158,10 +158,22 @@ class CausalTimedCover:
             due.append((s, x, nx))
         due.sort()                                         # smallest-first (head-of-line safety)
         out = []
-        for s, x, nx in due:
-            if self.tokens < s or self.spent + s > self.budget:
-                heapq.heappush(self.heap, (i + 1, x))      # can't afford now -> wait for tokens
+        for idx, (s, x, nx) in enumerate(due):
+            if self.spent + s > self.budget:
+                self.pending.pop(x, None)                  # will never afford this -> discard
                 continue
+            if self.tokens < s:
+                # Can't afford this. Since due is sorted smallest-first, we can't afford the rest either.
+                wait = int((s - self.tokens) / self.rate) + 1 if self.rate > 0 else 1_000_000
+                heapq.heappush(self.heap, (i + wait, x))
+                for s2, x2, nx2 in due[idx+1:]:
+                    if self.spent + s2 > self.budget:
+                        self.pending.pop(x2, None)
+                    else:
+                        w2 = int((s2 - self.tokens) / self.rate) + 1 if self.rate > 0 else 1_000_000
+                        heapq.heappush(self.heap, (i + w2, x2))
+                break
+            
             self.tokens -= s; self.spent += s
             self.pending.pop(x, None)
             if i <= nx:                                    # inserted BEFORE the use -> on-time
