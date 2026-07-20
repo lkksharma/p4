@@ -456,6 +456,43 @@ construction check passes. **PENDING (final):** repaired-harness re-run at gamma
 with the k=1 hazard (the pre-registered primary), then the fair-shot fallback (hazard retrained on
 the WIDE stream -- `p4_hazard.py --top-m` wired in 77050b4 for exactly this).
 
+## 8b. Cross-domain screen: LLM KV-cache serving (Mooncake, FAST'25) `[LOG]` -- FORK 1, clean
+
+New file `p4_llmcache.py` (commits 29bbb69, 3d3dea3): the instrument ported to KV-cache WARMING on
+Mooncake's production traces. Domain-honest port: TURN-GATED warming (a request's blocks are read
+simultaneously at prefill, so every arm -- bar AND ceiling -- may only warm at request boundaries;
+the corridor measures cross-turn warming = the TTFT lever); the vocab restriction is PHYSICAL here
+(a block never computed+stored cannot be warmed by any system). Pre-registered fork fixed in the
+docstring BEFORE the first real run; bars inherited unchanged (corridor >= 8, CI>0, Pareto; F2
+0.20/0.60). Two self-caught arm bugs, both flagged by the script's own invariants before any
+verdict was read: (1) the release queue dropped candidates the token bucket couldn't yet afford,
+starving the rate-limited ceiling (-1.5pt inversion on selftest); (2) the burst-vs-bucket protocol
+confound (bar bursts, ceiling rate-limited) flipped the corridor sign -- controlled with a BAR-CAP
+arm per HJS-L/Policy-1 precedent. Gate unchanged throughout.
+
+Logs `llmcache_conv_v2.log`, `llmcache_toolagent_v2.log` (1% cache, full markov1/2/3 x STRONG_TAUS
+x k grid, invariants ALL PASS):
+
+| trace | base | tuned bar | BAR-CAP | warm ceiling | corridor vs BAR | CI | vs BAR-CAP | protocol | F2 rho/AUC |
+|---|---|---|---|---|---|---|---|---|---|
+| conversation (12,031 req, 289k accesses) | 0.0786 | **0.1509** (m2 t.05 k4, prec .862) | 0.1155 | 0.1453 | **-0.56** | [-1.14,+0.04] | +2.98 | +3.55 | +0.268 / 0.805 PASS |
+| toolagent (23,608 req, 410k accesses) | 0.3664 | **0.4435** (m3 t.05 k4, prec .922) | 0.4034 | 0.4248 | **-1.87** | [-2.38,-1.36] | +2.14 | +4.01 | +0.003 / 0.993 FAIL |
+
+**Standing conclusion: FORK 1 on both traces -- NO corridor.** The tuned Markov bar IS the ceiling
+in this domain: prefix-chain reuse is so predictable (W2b association 0.728 vs popularity 0.008 on
+conv) that a tuned table already captures everything a clairvoyant, physically-constrained,
+iso-bandwidth warmer could. Even like-for-like (vs BAR-CAP) the clairvoyant margin is +2-3 pts,
+far below the 8-pt gate. Fork 2 (conquest domain) did NOT materialize: conv's think-time is
+learnable (F2 PASS) but there is no corridor for it to capture; toolagent has neither.
+
+**What this buys the paper:** the instrument now discriminates across THREE workload families with
+three distinct outcomes -- CDN/KV: corridor EXISTS but is clairvoyance-priced (the triple-kill);
+MSR/block: corridor absent below the gate; LLM KV serving: corridor ABSENT because a tuned causal
+warmer already sits on the ceiling. In every case the pre-registered verdict is "do not build the
+learned scheduler," reached BEFORE any model was trained -- the discipline as a portable decision
+procedure, not a one-domain autopsy. Limitations (stated): 1-hour traces, one provider, 1% cache
+primary, access-index lags.
+
 ## 8. Policy 2 -- recall-first forecaster -- not yet its own rung
 
 Decision logic wired inside Policy 1's report (`POLICY-2 PRIZE = market(oracle) - market(markov)`):

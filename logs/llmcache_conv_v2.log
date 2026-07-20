@@ -1,0 +1,55 @@
+[trace] /private/tmp/claude-501/-Users-primivista-Desktop-P4-CACHE/0c17f890-a164-450a-a9b7-79aa34f9ddb3/scratchpad/data/mooncake_conv.jsonl: 12,031 requests -> 288,500 block accesses, 182,790 unique blocks (reuse 36.6%), cache 1.0% = 1,827 blocks
+==========================================================================
+  W2   GAP -- LRU -> Belady headroom (guide: 10-25 OHR pts at 1%; <5 = no room)
+==========================================================================
+  footprint = 182,790 bytes
+     cache    LRU OHR   Belady OHR   gap (pts)
+      0.1%     0.0419       0.0880        4.61
+      1.0%     0.0529       0.2507       19.78
+     10.0%     0.2844       0.3771        9.26
+  W2: PASS -- gap@1% = 19.78 pts  (in the guide 10-25 band)
+==========================================================================
+  W2b  PREFETCH SIGNAL -- is there successor structure to prefetch at all?
+==========================================================================
+  held-out next-request coverage @top-16 (n=23,175):
+    association table : 0.7279
+    popularity baseline: 0.0081   (what a prefetcher gets for free)
+    lift = +0.7198
+  W2b: PASS -- real successor structure; prefetching can add hits Belady cannot
+
+  S3-FIFO base (no warming)  OHR 0.0786
+  [build] markov1 (0.6s)
+  [build] markov2 (2.1s)
+  [build] markov3 (4.7s)
+  predictor   tau   k      OHR  traffic   prec  admissible
+  [hazard] harvesting train window [144,250,216,375) -- full-trace replay, silent, ~10-25 min at wide k...
+  [hazard] harvesting eval window [216,375,288,500)...
+  [hazard] survival replay...
+
+  /private/tmp/claude-501/-Users-primivista-Desktop-P4-CACHE/0c17f890-a164-450a-a9b7-79aa34f9ddb3/scratchpad/data/mooncake_conv.jsonl   [hazard: markov2 tau=0.05 k=4]
+  split  predictor [0,144,250)  hazard-train [144,250,216,375)  F2-eval [216,375,288,500)   horizon 14,425
+  hazard-train emissions 48,063 (never 6.0%)   F2-eval emissions 16,049 (never 4.5%)
+  survival events 149,873   median lifetime 16 req   S(100)=1.000
+
+  F2  Spearman(pred median lag, true lag)  +0.268   [gate >= 0.20]
+  F2  never-bin AUC (P(never) vs used)     0.805   [gate >= 0.60]
+  F2 GATE  PASS -- when is learnable; build the scheduler
+
+
+====================================================================================================
+  PHANTOM HEADROOM x LLM KV-CACHE SERVING -- /private/tmp/claude-501/-Users-primivista-Desktop-P4-CACHE/0c17f890-a164-450a-a9b7-79aa34f9ddb3/scratchpad/data/mooncake_conv.jsonl
+  (turn-gated warming; ceiling vocab = physically warmable blocks; iso-BW)
+====================================================================================================
+  arm                               OHR  traffic   warmings   prec
+  S3-FIFO base (no warming)      0.0786     1.00          -      -
+  TUNED BAR (markov2 t0.05 k4)   0.1509     1.01     25,111  0.862
+  BAR-CAP (same bucket)          0.1155     1.01     14,452  0.761
+  LEARNABLE CEILING (warm)       0.1453     1.01     21,542  0.805
+  ------------------------------------------------------------------------------------------------
+  CORRIDOR vs BAR      -0.56 pts   95% CI [-1.14,+0.04]   Pareto NO   [pre-registered gate >= 8, CI>0]   -> below gate
+  CORRIDOR vs BAR-CAP  +2.98 pts   95% CI [+2.60,+3.39]   (like-for-like protocol)   PROTOCOL COST +3.55 pts (bar burst vs bucket)
+  F2-lite  Spearman +0.268 [>=0.20]   never-AUC 0.805 [>=0.60]   S(100)=1.000   -> when LEARNABLE
+  INVARIANTS  all pass
+  VERDICT  FORK 1 -- NO corridor: tuned causal warming already captures the reuse. The instrument says do NOT build a learned warmer here; that prospective 'do not build' is the phantom-headroom discipline paying out in a second domain.
+====================================================================================================
+
