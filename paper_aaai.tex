@@ -46,6 +46,8 @@ The project's own history is part of the evidence. A first measurement of ``timi
 \paragraph{Contributions.} (i) a pre-registered iso-bandwidth instrument whose object is the learnable corridor, with machine-checkable invariants and a taxonomy of four inflation mechanisms; (ii) a deflationary measurement across 12 traces plus the substitutes result; (iii) the Necessity Ladder and its verdict, a triple kill that renders the surviving corridor clairvoyance-priced; (iv) the endogenous-slack mechanism separating rank-learnability from placement; (v) the first honest headroom measurement for LLM KV-cache warming, and with it a three-domain demonstration that the instrument discriminates rather than merely deflates. No prevalence is claimed. The claims are existence with confidence intervals, absence with mechanisms, unreachability by oracle decomposition, and a protocol others can apply.
 
 \section{Related Work}
+Four lines of work bound or chase cache-prefetch gains, and each leaves a different part of the honest-headroom question open; the specific gap this paper closes is named against each.
+
 \textbf{Optimal replacement and prefetch-aware repairs.} Belady's MIN \citep{belady} is optimal for demand caching without prefetching. \citet{demandmin} showed that under prefetching MIN no longer minimizes demand misses and that a family of prefetch-aware optima trades demand misses against prefetch traffic, establishing that ``the optimum'' is bandwidth-relative for uniform hardware lines. This work transports that insight to variable-size object caches and adds the reachability split: it bounds what a history-based policy could do, not what an omniscient one could. \citet{cao} gave near-optimal integrated prefetching-plus-caching under clairvoyance, uniform sizes, and a latency model; none of the three holds for CDN/KV objects, so ceilings here are measured empirically per trace.
 
 \textbf{Learned caching.} LRB \citep{lrb} imitates a relaxed Belady oracle for CDN eviction; Cold-RL \citep{coldrl}, DEAP \citep{deap}, DeePref \citep{deepref}, and LightCacheRL \citep{lightcache} learn eviction and/or prefetching; Pythia \citep{pythia} tunes hardware-prefetcher aggressiveness with online RL; \citet{jointhw} share representations between hardware replacement and prefetching. \textbf{Baleen} \citep{baleen} is the nearest neighbor: it learns flash admission and prefetching and reports against an OPT-derived episodes bound, but it does not measure a corridor at matched prefetch bandwidth nor split its bound by reachability, so its target inherits exactly the phantom component priced out here. To current knowledge no prior work constructs a pre-registered, bandwidth-matched, learnability-split headroom measurement for object caches, nor gates a learned component on an oracle decomposition of necessity.
@@ -55,9 +57,17 @@ The project's own history is part of the evidence. A first measurement of ``timi
 \textbf{Evaluation rigor as a contribution.} \citet{sober} showed that claimed language-model reasoning gains shrink under standardized, variance-aware protocols. This paper is the caching analog, with one addition: it prices the corrected headroom's capturability before any learning is attempted. S3-FIFO \citep{s3fifo} is the fixed evictor throughout, so every corridor is attributable to prefetch scheduling rather than evictor weakness; the substitutes result justifies freezing it.
 
 \section{The Instrument}
+The instrument is one deterministic replay in which four arms share a single prefetch byte budget; the corridor is the gap between two of them, and every degree of freedom that could inflate it is fixed before any real-trace run.
+
 \textbf{Setup.} Deterministic replay over 2M-request prefixes of production traces, byte-capacity cache at 1\% of trace footprint, first 5\% of requests as warmup, request-weighted object hit ratio (OHR) as the primary metric. The evictor is S3-FIFO in every arm. Predictors are decoupled (they see the request stream, never the future), train on the first 50\% and are frozen; association tables store full confidence-ranked candidate lists so a sweep over threshold $\tau$ and degree $k$ costs one table build. Prefetched bytes are charged to origin traffic; a prefetched-then-requested object is a hit, a prefetched-then-evicted object is waste. This accounting is unit-tested.
 
-\textbf{The four arms.} \emph{BASE}: S3-FIFO, no prefetch; its origin bytes are the traffic denominator. \emph{TUNED BAR}: the best decoupled system constructible against the corridor's own interest, $\max$ OHR over $\{$Markov-1, Markov-2, Markov-3 ($3{\to}2{\to}1$ backoff), LSTM$\}\times\tau\times k$ subject to origin traffic $\le 1.15\times$ BASE. The cap is 1.15, not 1.10, because the default config lands at $1.10\times$ and a tighter cap could reject it on float noise; the cap errs against the corridor. \emph{GROSS CEILING}: a clairvoyant prefetcher (soonest-future uncached objects) throttled by a token bucket to the bar's measured prefetch byte \emph{rate} (a rate, not a total: a total is spent greedily and then stops, which once made an oracle score below a heuristic). Reported as a diagnostic. \emph{WARM CEILING} (primary): the same clairvoyant restricted to training-vocabulary objects, same bucket. Because the bucket is unchanged, budget the gross oracle wastes on unreachable cold objects is \emph{re-spent} on warm ones. This is the honest upper bound for any history-based scheduler: perfect timing, realistic knowledge, equal budget.
+\textbf{The four arms.} All four run at the tuned bar's measured byte rate, and two of them bracket the corridor. \emph{BASE}: S3-FIFO, no prefetch; its origin bytes are the traffic denominator. \emph{TUNED BAR}: the best decoupled system constructible against the corridor's own interest, $\max$ OHR over $\{$Markov-1, Markov-2, Markov-3 ($3{\to}2{\to}1$ backoff), LSTM$\}\times\tau\times k$ subject to origin traffic $\le 1.15\times$ BASE. The cap is 1.15, not 1.10, because the default config lands at $1.10\times$ and a tighter cap could reject it on float noise; the cap errs against the corridor. \emph{GROSS CEILING}: a clairvoyant prefetcher (soonest-future uncached objects) throttled by a token bucket to the bar's measured prefetch byte \emph{rate} (a rate, not a total: a total is spent greedily and then stops, which once made an oracle score below a heuristic). Reported as a diagnostic. \emph{WARM CEILING} (primary): the same clairvoyant restricted to training-vocabulary objects, same bucket. Because the bucket is unchanged, budget the gross oracle wastes on unreachable cold objects is \emph{re-spent} on warm ones. This is the honest upper bound for any history-based scheduler: perfect timing, realistic knowledge, equal budget.
+
+\begin{figure}[t]\centering
+\includegraphics[width=0.95\columnwidth]{Figures/instrument}
+\caption{The instrument: four arms at one shared prefetch byte budget. The tuned bar (blue) is the adversarial baseline; the gross ceiling (orange) is a diagnostic that over-counts by eliminating compulsory misses; the warm ceiling (green) restricts the clairvoyant to training-vocabulary objects and re-spends the wasted cold budget, giving the honest upper bound. The learnable corridor is warm minus bar; a trace is LIVE only if it clears $8$ points and the warm ceiling Pareto-dominates. Bar and warm ceiling each record zero cold prefetch hits by construction.}
+\label{fig:instrument}
+\end{figure}
 
 \textbf{Why the warm ceiling, not subtraction.} The shortcut ``learnable $\approx$ gross corridor $-$ cold slice'' is wrong in both directions. It over-penalizes because the oracle's cold prefetches consumed budget a warm-only policy would redirect (on Wikipedia, 27\% of the gross oracle's useful prefetches were cold; redirected, that budget buys $+5.4$ warm points). It can under-penalize via eviction coupling. Measured here, subtraction misstates the corridor by up to 5.4 points, enough to flip a verdict. Reachability must be priced \emph{inside} the replay, at the budget. An invariant enforces it: the bar and the warm ceiling each record exactly zero cold prefetch hits by construction. (A first ``cold'' definition, ``not yet requested at issue,'' violated this: the bar scored 442{,}188 ``cold'' hits where the out-of-vocabulary definition gives zero. The invariant caught it.)
 
@@ -89,6 +99,8 @@ trace & family & base & tuned bar & gross corr. & verdict & kill mechanism \\
 \end{table*}
 
 \section{Results: Measurement}
+Two questions decide Part~I: how large is the honestly measured corridor, and where does the inflated part of the gross number go? The first is answered per trace, the second by a warm/cold decomposition.
+
 \textbf{Gross corridors and their deaths.} Table~\ref{tab:gatea} reports Gate A. Three points: the tuned bar is load-bearing (\texttt{cluster26} flips to dead once escalated); the LSTM never rescues a surviving corridor, so survivors are not weak-predictor artifacts; and liveness is not a family property (block yields both $+10.08$ and $-3.81$; KV yields both $+25.72$ and $-1.18$).
 
 \textbf{The learnable corridor: 14--87\% is phantom.} Table~\ref{tab:learnable} decomposes the six gross-live traces. The three CDN/block traces with the largest gross corridors lose 51--87\% to the cold slice, because high object churn spends the clairvoyant budget on compulsory misses; the two low-churn KV traces lose only 14--20\%. Wikipedia is the instructive middle case: 52\% phantom, yet enough exploitable warm reuse that the honest corridor still clears the bar, but only once the warm ceiling re-spends the cold budget (naive subtraction leaves it at $+7.27$, a false kill). Per-request hit indicators for bar and warm ceiling are recorded on the same post-warmup requests; the corridor is the mean paired difference, resampled as 1{,}000 contiguous blocks, 10{,}000 resamples (block, not i.i.d., because hits are autocorrelated through cache state). All three surviving lower bounds clear the 8-point bar. (\texttt{cluster53}'s decomposition uses its Markov bar; against its higher LSTM bar, with the ceiling still handicapped to the smaller Markov budget, the corridor is $\ge +18.4$, so the verdict is unchanged.)
@@ -123,33 +135,9 @@ trace & gross & cold & warm & \textbf{learnable} (95\% CI) \\
 \section{The Necessity Ladder}
 The three live corridors invite a learned scheduler. The Necessity Ladder replaces that reflex with a question sequence, each rung a pre-registered, replay-only gate isolating \emph{one} ingredient with an oracle and pricing it before anything is trained (Figure~\ref{fig:ladder}, Table~\ref{tab:decomp}). Every arm freezes S3-FIFO, respects the bar's byte budget through the same token bucket, and reports paired block-bootstrap CIs. Oracle arms exist only to bound what is possible.
 
-\begin{figure}[t]
-\centering
-\begin{tikzpicture}[
-  font=\footnotesize,
-  rung/.style={draw,rounded corners,align=left,inner sep=3pt,text width=5.2cm,minimum height=4mm},
-  v/.style={align=center,inner sep=1pt,text width=2.5cm},
-  live/.style={fill=black!8},
-  dead/.style={fill=black!18},
-  ar/.style={-{Latex[length=1.6mm]}}
-]
-\node[rung,live] (f1) {\textbf{F1} timing ceiling on the bar's own vocabulary};
-\node[v,right=2mm of f1] (v1) {91--96\% of corridor};
-\node[rung,dead,below=2.2mm of f1] (f4) {\textbf{F4$'$} learned arbitration vs threshold rule};
-\node[v,right=2mm of f4] (v4) {$<1$ pt: unnecessary};
-\node[rung,dead,below=2.2mm of f4] (fs) {\textbf{F1-stream} perfect timing of the offered stream};
-\node[v,right=2mm of fs] (vs) {$-7$ / $-11$: below bar};
-\node[rung,live,below=2.2mm of fs] (f5) {\textbf{F5} wide emission $+$ clairvoyant JIT};
-\node[v,right=2mm of f5] (v5) {$+10.4$ / $+11.4$};
-\node[rung,dead,below=2.2mm of f5] (p1) {\textbf{Policy 1} wide $+$ perfect forecaster, at emission};
-\node[v,right=2mm of p1] (vp) {$\le 6\%$ of F5};
-\node[rung,dead,below=2.2mm of p1] (f7) {\textbf{F7} F5 coverage, \emph{causal} use-lag timing};
-\node[v,right=2mm of f7] (v7) {$-40$ / $-26$};
-\node[rung,dead,below=2.2mm of f7] (cgp) {\textbf{CGP} coverage without volume (arm+fire)};
-\node[v,right=2mm of cgp] (vc) {$-7.6$ / $-5.4$};
-\foreach \a/\b in {f1/f4,f4/fs,fs/f5,f5/p1,p1/f7,f7/cgp} \draw[ar] (\a.south) -- (\b.north);
-\end{tikzpicture}
-\caption{The Necessity Ladder as run (wiki / cluster50). Light rungs certify what is reachable; dark rungs are the kills. The corridor survives every rung that could certify it (F1, F5) and dies on every causal ingredient, ending with a policy built specifically to escape.}
+\begin{figure}[t]\centering
+\includegraphics[width=0.98\columnwidth]{Figures/ladder}
+\caption{The Necessity Ladder as run (wiki / cluster50). Green rungs are the two clairvoyant checks that certify the corridor reachable in principle (F1 timing, F5 coverage); red rungs are the kills. Each rung is a pre-registered oracle decomposition that isolates one ingredient and prices it by replay before any model is trained. The corridor survives every rung that could certify it and dies on every causal ingredient, ending with CGP, a policy built specifically to escape the bottleneck.}
 \label{fig:ladder}
 \end{figure}
 
@@ -225,6 +213,8 @@ LLM KV serving & no corridor & trivial policy is ceiling \\
 \end{table}
 
 \section{Scope and Threats to Validity}
+Five limits bound the claims, and naming them also fixes their direction: the measurement caveats point toward conservatism, the capture caveats toward a narrower but firmer kill.
+
 ``Learnable'' is defined against frozen, history-based prediction (training-prefix vocabulary). An online-updating or content-aware predictor could reach cold objects and would \emph{raise} live corridors, so the measurement verdicts are conservative in that direction. The capture verdict is not symmetric: F5 already grants the widest emission the family supports, and F7/CGP fail for timing and redundancy reasons a larger vocabulary does not touch; the F7 kill was accepted only after the pre-registered wide-stream fallback. The capture kill is bounded by its decomposition (Table~\ref{tab:decomp}); a design outside it (for example, modifying the evictor to protect warmed objects) is out of scope, though the substitutes result argues against it. One cache size (1\%), 2M-request prefixes, request-weighted OHR; byte-weighted results and cache-size sweeps are future work. Twitter traces are 1-in-10 samples, which stretches inter-reference gaps, so absolute OHRs are not comparable to unsampled deployments. LLM traces cover one hour of one provider, and lags are in access-index units. CIs cover within-trace variance only; the escalation protocol addresses sweep granularity structurally, since every error in the bar inflates corridors and the capture kills are upper bounds on scrutiny.
 
 \section{Conclusion}
