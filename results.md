@@ -490,6 +490,43 @@ insufficient (Policy 1), causal JIT timing unreachable (F7), and the pre-registe
 too. The corridor is CLAIRVOYANCE-PRICED. This is the paper's Part II. Numbers locked into paper.tex
 (commit pending).
 
+## 7i. CGP -- Corroboration-Gated Prefetch, the CONSTRUCTIVE rung `[PASTE]` -- FAIL (rung 6)
+
+New file `p4_cgp.py`, pre-registration `SPEC_cgp_prereg.md` (both committed BEFORE the run). The one
+causal policy class designed to escape endogenous slack: ARM wide + byte-free (a watchlist, no
+fetch), FIRE on a tight event, fund `s(X)=conf_fire(X)*(1+beta*armed(X))` under the bar's exact byte
+budget (bucket + hard cap). Coverage from arming (free), volume pinned at the bar's (no survival
+collapse). beta=0 = fire-only ablation. Pre-registered gate: >= +2.5 vs BAR, CI lo > 0, both traces.
+
+Real-trace results (`cgp_wiki.log`, `cgp_c50.log`, node; tuned over beta/tau_fire/W_arm grid):
+
+| trace | BAR | BEST CGP | corridor vs BAR | CI | vs BAR-CAP | fire-only | arm lift | prec | pf issued |
+|---|---|---|---|---|---|---|---|---|---|
+| wiki | 0.5531 | 0.4771 (b2 tf.02 wa10k) | **-7.60** | [-8.11,-7.08] | +0.98 | -7.78 | **+0.18** | 0.566 | 1.22M |
+| cluster50 | 0.7080 | 0.6541 (b2 tf.02 wa10k) | **-5.39** | [-5.89,-4.89] | +1.01 | -5.35 | **-0.04** | 0.269 | 1.60M |
+
+**FAIL on both, decisively, and for a measured reason.** The killer is the pre-registered kill
+criterion firing exactly: **armed and un-armed fires have IDENTICAL precision** (c50 tf=0.02: b0
+0.269, b2/b4 0.268), while beta raises the armed share of funded fires 43%->69%. So the wide-arm
+watchlist reorders funding toward armed objects but those objects are no more likely to be used --
+**the corroboration signal is redundant with the predictor's own confidence.** Arm lift ~0 (+0.18 /
+-0.04). CGP also still count-floods (1.2-1.6M fetches vs bar's 665k at prec 0.27-0.57; byte cap holds
+at 0.95x but object count explodes on small objects), so it eats the bucket's protocol cost (-6.4 to
+-8.6) without the precision to overcome it (F5, also bucketed, overcomes it with prec 1.0).
+
+**Not laundered:** CGP beats BAR-CAP (same bucket) by +1.0 CI-clear, but fire-only gets the same,
+it is vs the handicapped baseline, and the gate was vs BAR. Reported as FAIL, not a partial win.
+**No rescue run:** armed-only hard gate funds the same-precision subset (fewer useful hits);
+count-matching to the bar's 665k reconstructs the bar's own top-by-confidence choices (-> ~= bar).
+Both futile by the redundancy already measured, so neither is run -- fishing after a pre-registered
+kill is exactly the discipline breach the project forbids.
+
+**Ladder now 6 rungs, all negative-or-unnecessary:** F4' (RL unnecessary), F1-stream (timing the
+offered stream loses), Policy 1 (at-emission insufficient), F7 (causal JIT unreachable), CGP
+(corroboration redundant -> no free coverage). The corridor is real, reachable only clairvoyantly,
+and the constructive attempt designed against the exact bottleneck fails because the second signal
+carries no independent information. This COMPLETES Part II as a stronger negative, not a weaker one.
+
 ## 8b. Cross-domain screen: LLM KV-cache serving (Mooncake, FAST'25) `[LOG]` -- FORK 1, clean
 
 New file `p4_llmcache.py` (commits 29bbb69, 3d3dea3): the instrument ported to KV-cache WARMING on
