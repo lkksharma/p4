@@ -33,14 +33,17 @@ The three arms (demand-only; no prefetch anywhere here)
     Belady       evict the object whose true next use is FARTHEST away -- the eviction ceiling.
                  Exact optimum for uniform-size (block) objects; a strong reference for variable
                  sizes (see p4_cache).
-    Learned      LRB-lite: Belady with the true next-use replaced by a MODEL's prediction. A frozen
-                 gradient-boosted regressor, trained on the first half of the trace, predicts each
-                 object's reuse distance from causal features (recency, frequency, size, mean
-                 inter-access interval, residency age). It peeks at NO future at decision time, so
-                 unlike Belady it is deployable. Mechanically it is identical to BeladyEvictor with
-                 key = (access position + predicted distance) instead of the true next-use time,
-                 so it is heap-driven and as fast as Belady -- the model is called ONCE, batched
-                 over the whole trace, not per eviction.
+    Learned      LRB-lite: a frozen gradient-boosted regressor, trained on the first half of the
+                 trace, predicts an object's reuse distance from causal features (recency,
+                 frequency, size, mean inter-access interval, residency age). At each eviction it
+                 scores a random sample of residents with their CURRENT features (age = now - last
+                 access) and evicts the largest predicted distance. It peeks at NO future at
+                 decision time, so unlike Belady it is deployable. Predicting at eviction time with
+                 the current age -- not once at access time -- is essential: a frozen access-time
+                 prediction goes stale when it is wrong and traps mispredicted objects in the cache
+                 (they look imminently due forever); re-scoring on current age instead makes an
+                 unused object more evictable the longer it waits, which self-corrects the model's
+                 mistakes.
 
     EVICTION CORRIDOR   = Belady OHR  - S3-FIFO OHR      (is there room above the tuned evictor?)
     CAPTURED            = Learned OHR - S3-FIFO OHR      (does a deployable policy realise it?)
@@ -71,7 +74,6 @@ Usage
 from __future__ import annotations
 
 import argparse
-import heapq
 import math
 import time
 
@@ -110,100 +112,117 @@ def synth_positive(n_req=150_000, n_hot=3000, hot_zipf=1.05, p_hot=0.5, cold_siz
     return dict(obj_id=ids, size=sizes, next_vtime=compute_next_access(ids), n=n_req)
 
 
-# ------------------------------------------------------------- causal features (shared)
-def causal_features(ids, szs, n_upto, want_labels=False, nxt=None, n_total=None):
-    """One causal pass building, for each position i in [0, n_upto), the feature row describing the
-    object's state JUST BEFORE its access at i (past-only -- no leakage). Optionally also returns
-    the Belady-imitation label log1p(reuse distance) and a `fresh` mask (True on an object's first
-    occurrence, where freq==0). Fresh rows are trained on too: a one-hit-wonder is a resident with
-    freq==0 features and a next-use of NEVER, exactly what Belady evicts first."""
-    last, freq, first, size = {}, {}, {}, {}
-    F = np.zeros((n_upto, FEATS), dtype=np.float64)
-    fresh = np.zeros(n_upto, dtype=bool)
-    y = np.zeros(n_upto, dtype=np.float64) if want_labels else None
-    NEVERv = int(NEVER)
-    for i in range(n_upto):
-        o = int(ids[i]); s = int(szs[i]); f = freq.get(o, 0)
-        if f > 0:
-            la = last[o]; fi = first[o]; sz = size.get(o, s)
-            age = i - la; span = la - fi; mi = span / max(f - 1, 1)
-            F[i, 0] = math.log1p(age); F[i, 1] = math.log1p(f); F[i, 2] = math.log1p(max(sz, 0))
-            F[i, 3] = math.log1p(max(mi, 0)); F[i, 4] = math.log1p(max(i - fi, 0))
-        else:
-            fresh[i] = True
-            F[i, 2] = math.log1p(max(s, 0))          # size is known even on first sight
-        if want_labels:
-            nx = int(nxt[i]); dist = (nx - i) if nx < NEVERv else n_total
-            y[i] = math.log1p(max(dist, 0))
-        freq[o] = f + 1; last[o] = i
-        first.setdefault(o, i); size[o] = s
-    return (F, fresh, y) if want_labels else (F, fresh)
+# ------------------------------------------------------------- feature construction (shared)
+def _feat_row(row, j, age, freq, size, mi, resid):
+    row[j, 0] = math.log1p(max(age, 0)); row[j, 1] = math.log1p(max(freq, 0))
+    row[j, 2] = math.log1p(max(size, 0)); row[j, 3] = math.log1p(max(mi, 0))
+    row[j, 4] = math.log1p(max(resid, 0))
 
 
 def train_model(trace, train_frac, max_train, trees, seed):
-    """Belady-imitation regressor on the trace PREFIX. Features are past-only; the label uses the
-    object's own next-access column (the definition of supervised learning, not leakage)."""
+    """Belady-imitation regressor on the trace PREFIX, trained on CENSORED samples so its input
+    distribution matches EVICTION time, not access time. At an access, an object is not evaluated
+    for eviction at the moment it is used, but at some later partial age while it waits; so for each
+    realised inter-access gap (la -> i) we draw a probe age in (0, i-la], set the features at that
+    partial age, and label = log1p(remaining distance = i - probe). One-shot objects (next use is
+    NEVER) also sit in the cache and must be evicted: for each such last access we draw a probe age
+    and label it log1p(n) (max distance), teaching the model to evict aged low-frequency objects.
+    Features are past-only (no leakage); the label uses the object's own next-access column."""
     from sklearn.ensemble import HistGradientBoostingRegressor
-    n = trace["n"]; cut = int(n * train_frac)
-    X, fresh, y = causal_features(trace["obj_id"], trace["size"], cut,
-                                  want_labels=True, nxt=trace["next_vtime"], n_total=n)
-    # Train on ALL rows, INCLUDING first-occurrence ('fresh') ones: a one-hit-wonder sits in the
-    # cache with freq==0 features and a next-use of NEVER (label = log1p(n)), which is precisely the
-    # object Belady evicts first. Dropping fresh rows blinds the model to that, and it then keeps
-    # one-shot objects and loses to S3-FIFO. The `fresh` mask is kept only for diagnostics.
-    if len(X) > max_train:
-        rng = np.random.default_rng(seed)
-        idx = rng.choice(len(X), max_train, replace=False)
-        X, y = X[idx], y[idx]
+    ids, szs, nxt = trace["obj_id"], trace["size"], trace["next_vtime"]
+    n = trace["n"]; cut = int(n * train_frac); NEVERv = int(NEVER)
+    rng = np.random.default_rng(seed)
+    HMAX = 100_000                                   # probe-age horizon for one-shot (never) samples
+    last, freq, first, size = {}, {}, {}, {}
+    rows = []                                        # each: (age, freq, size, mi, resid, label)
+    for i in range(cut):
+        o = int(ids[i]); s = int(szs[i]); f = freq.get(o, 0); nx = int(nxt[i])
+        if f > 0:                                    # a realised reuse gap la -> i: censored probe
+            la = last[o]; fi = first[o]; sz = size.get(o, s)
+            span = i - la; mi = (la - fi) / max(f - 1, 1)
+            age = 1 + int(rng.integers(0, span)) if span > 0 else 0
+            rows.append((age, f, sz, mi, (la + age) - fi, math.log1p(max(span - age, 0))))
+        if nx >= NEVERv:                             # o's last appearance: a soon-to-be-dead resident
+            fi = first.get(o, i); f1 = f + 1; sz = s
+            mi = (i - fi) / max(f1 - 1, 1) if f1 > 1 else 0.0
+            age = 1 + int(rng.integers(0, HMAX))
+            rows.append((age, f1, sz, mi, (i - fi) + age, math.log1p(n)))
+        freq[o] = f + 1; last[o] = i
+        first.setdefault(o, i); size[o] = s
+    arr = np.asarray(rows, dtype=np.float64)
+    if len(arr) > max_train:
+        arr = arr[rng.choice(len(arr), max_train, replace=False)]
+    X = np.empty((len(arr), FEATS), dtype=np.float64)
+    X[:, 0] = np.log1p(np.clip(arr[:, 0], 0, None)); X[:, 1] = np.log1p(np.clip(arr[:, 1], 0, None))
+    X[:, 2] = np.log1p(np.clip(arr[:, 2], 0, None)); X[:, 3] = np.log1p(np.clip(arr[:, 3], 0, None))
+    X[:, 4] = np.log1p(np.clip(arr[:, 4], 0, None))
+    y = arr[:, 5]
     m = HistGradientBoostingRegressor(max_iter=trees, learning_rate=0.1, max_leaf_nodes=31,
                                       min_samples_leaf=50, l2_regularization=1.0, random_state=seed)
     m.fit(X, y)
-    return m, len(X)
-
-
-def predicted_next_use(trace, model):
-    """One batched predict over the whole trace -> for each position i, the model's predicted
-    ABSOLUTE next-use position (i + predicted distance). This is the exact analogue of the true
-    next-use column Belady evicts on, so the learned evictor is Belady with this column swapped in.
-    Computing it once amortises the model to a single call (per-eviction predict is 100x slower)."""
-    X, _ = causal_features(trace["obj_id"], trace["size"], trace["n"])
-    pred_log = model.predict(X)                          # predicted log1p(distance)
-    dist = np.expm1(np.clip(pred_log, 0, None))          # back to distance; clip guards tiny negatives
-    return np.arange(trace["n"], dtype=np.float64) + dist
+    return m, len(arr)
 
 
 # --------------------------------------------------------------------- the learned evictor
 class LearnedEvictor:
-    """Heap-driven, exactly like BeladyEvictor, but keyed on the model's predicted next-use
-    (pred_next[i]) instead of the true next-use time. Evict the resident whose predicted next use
-    is farthest. Lazy deletion: a stale heap entry is one whose key no longer matches key[o]."""
+    """LRB-lite (LRB's actual recipe): at each eviction, predict the reuse distance of a RANDOM
+    SAMPLE of residents using their CURRENT features -- crucially age = now - last access -- and
+    evict the largest. Predicting at eviction time with the current age is what makes an imperfect
+    model self-correcting: a mispredicted object that sits unused keeps ageing, so its predicted
+    distance keeps growing and it becomes MORE evictable; a prediction frozen at access time instead
+    goes stale and traps the object forever. New objects join the resident pool immediately and are
+    ranked like any other (no probationary protection, which would let one-shot objects accumulate).
+    Sampling (LRB uses 64) makes each eviction O(K) rather than O(cache)."""
     name = "learned"
 
-    def __init__(self, pred_next):
-        self.pred = pred_next
-        self.key, self.heap = {}, []
+    def __init__(self, model, sample_k=64, seed=0):
+        self.model, self.K = model, sample_k
+        self.rng = np.random.default_rng(seed)
+        self.last, self.freq, self.first, self.size = {}, {}, {}, {}
+        self.res, self.pos = [], {}                  # resident list + index map (O(1) swap-remove)
+        self._t = 0                                  # current time, set by replay before eviction
 
-    def _set(self, o, i):
-        k = float(self.pred[i])
-        self.key[o] = k
-        heapq.heappush(self.heap, (-k, o))               # max-key at the top
+    def _obs(self, o, t, s=None):
+        self.freq[o] = self.freq.get(o, 0) + 1
+        self.last[o] = t
+        if o not in self.first:
+            self.first[o] = t
+        if s is not None:
+            self.size[o] = s
 
-    def hit(self, o, i):
-        self._set(o, i)                                  # refresh prediction at this access
+    def hit(self, o, t):
+        self._obs(o, t)
 
-    def admit(self, o, s, i):
-        self._set(o, i)
+    def admit(self, o, s, t):
+        self._obs(o, t, s)
+        if o not in self.pos:
+            self.pos[o] = len(self.res); self.res.append(o)
+
+    def _remove(self, o):
+        idx = self.pos.pop(o, None)
+        if idx is None:
+            return
+        tail = self.res.pop()
+        if idx < len(self.res):
+            self.res[idx] = tail; self.pos[tail] = idx
 
     def evict_one(self):
-        while self.heap:
-            negk, o = heapq.heappop(self.heap)
-            if o in self.key and self.key[o] == -negk:   # not a stale entry
-                del self.key[o]
-                return o
-        return None
+        L = len(self.res)
+        if L == 0:
+            return None
+        t = self._t
+        cand = self.res if L <= self.K else [self.res[j]
+                                             for j in np.unique(self.rng.integers(0, L, self.K))]
+        X = np.empty((len(cand), FEATS), dtype=np.float64)
+        for j, o in enumerate(cand):
+            la = self.last[o]; f = self.freq[o]; fi = self.first[o]
+            _feat_row(X, j, t - la, f, self.size.get(o, 1), (la - fi) / max(f - 1, 1), t - fi)
+        vo = cand[int(np.argmax(self.model.predict(X)))]   # largest predicted distance -> evict
+        self._remove(vo)
+        return vo
 
     def forget(self, o):
-        self.key.pop(o, None)
+        self._remove(o)
 
 
 # ------------------------------------------------------------------ demand-only replay (local)
@@ -242,6 +261,8 @@ def replay(trace, cap, ev, warmup_frac=0.05, mode="plain", return_hits=True, pro
                 ev.hit(o)
         else:                                            # ---- MISS ----
             if s <= cap:
+                if mode == "learned":
+                    ev._t = i                            # eviction scores use the CURRENT age (now - last)
                 while used + s > cap and cached:
                     vo = ev.evict_one()
                     if vo is None or vo not in cached:
@@ -289,8 +310,10 @@ def _construction_check(trace, cap, pos, szs, warmup):
 
 # ---------------------------------------------------------------------------------- selftest
 def selftest():
-    """Construction check on SYNTH (uniform-size, so Belady is the exact eviction optimum), plus a
-    fast end-to-end learned run to prove the heap-driven learned evictor beats S3-FIFO there."""
+    """Fast startup gate: assert the local demand replay reproduces PFCache's OHR EXACTLY for
+    S3-FIFO and Belady (so the learned arm sits on identical footing), and that Belady dominates
+    S3-FIFO on SYNTH. Deliberately does NOT run the learned evictor (per-eviction prediction is
+    slow); the learned capture demonstration lives behind --selftest (see learned_demo)."""
     from p4_cache import footprint_bytes, synth_trace
     from p4_prefetch import build_obj_positions, build_obj_sizes
     tr = synth_trace(n_req=120_000, n_obj=8_000, zipf_a=1.1, seq_frac=0.3, seed=0)
@@ -299,10 +322,26 @@ def selftest():
     ok, b, e = _construction_check(tr, cap, pos, szs, 0.05)
     assert ok, "local replay does not reproduce PFCache -- learned arm would be unfair"
     assert e["ohr"] >= b["ohr"], f"Belady must dominate S3-FIFO on SYNTH: {e['ohr']} vs {b['ohr']}"
-    model, _ = train_model(tr, 0.5, 80_000, 80, 0)
-    lr = replay(tr, cap, LearnedEvictor(predicted_next_use(tr, model)), 0.05, mode="learned")
-    print(f"[p4_evictlearn selftest] PASS -- replay==PFCache; SYNTH eviction corridor "
-          f"{100*(e['ohr']-b['ohr']):+.2f} pts, learned captures {100*(lr['ohr']-b['ohr']):+.2f} pts")
+    print(f"[p4_evictlearn selftest] PASS -- replay==PFCache for S3-FIFO and Belady; "
+          f"SYNTH eviction corridor {100*(e['ohr']-b['ohr']):+.2f} pts")
+
+
+def learned_demo(seed=0):
+    """--selftest extra: a small LEARNABLE workload proving the deployable evictor captures a
+    substantial, positive fraction of a real eviction corridor (the pipeline can green-light)."""
+    from p4_cache import footprint_bytes
+    from p4_prefetch import build_obj_positions, build_obj_sizes
+    tr = synth_positive(n_req=40_000, n_hot=800, seed=seed)
+    cap = max(int(footprint_bytes(tr) * 0.01), 1)
+    pos = build_obj_positions(tr); szs = build_obj_sizes(tr)
+    b = replay(tr, cap, S3FIFOEvictor(cap), 0.05, mode="plain")
+    e = replay(tr, cap, BeladyEvictor(cap, pos), 0.05, mode="oracle")
+    m, _ = train_model(tr, 0.5, 80_000, 120, seed)
+    lr = replay(tr, cap, LearnedEvictor(m, sample_k=64, seed=seed), 0.05, mode="learned")
+    corr = 100 * (e["ohr"] - b["ohr"]); capg = 100 * (lr["ohr"] - b["ohr"])
+    print(f"[learned_demo] learnable workload: corridor {corr:+.2f} pts, deployable evictor "
+          f"captures {capg:+.2f} pts ({100*capg/corr if corr > 0.1 else 0:.0f}%)  "
+          f"[S3-FIFO {b['ohr']:.4f}  Belady {e['ohr']:.4f}  Learned {lr['ohr']:.4f}]")
 
 
 # -------------------------------------------------------------------------------------- main
@@ -320,11 +359,12 @@ def run(trace, cap, pos, szs, args):
 
     t0 = time.time()
     model, n_train = train_model(trace, args.train_frac, args.max_train, args.trees, args.seed)
-    pred_next = predicted_next_use(trace, model)
-    print(f"  [train] LRB-lite on {n_train:,} samples x {FEATS} causal features, {args.trees} trees; "
-          f"predicted next-use column built in one batched call ({time.time()-t0:.1f}s)")
+    print(f"  [train] LRB-lite on {n_train:,} censored samples x {FEATS} causal features, "
+          f"{args.trees} trees ({time.time()-t0:.1f}s); evicting on current-age predictions, "
+          f"current-age predictions over a {args.sample_k}-resident sample")
 
-    learn = replay(trace, cap, LearnedEvictor(pred_next), warmup, mode="learned", return_hits=True,
+    learn = replay(trace, cap, LearnedEvictor(model, sample_k=args.sample_k, seed=args.seed),
+                   warmup, mode="learned", return_hits=True,
                    progress="learned-evictor" if args.tqdm else None)
 
     bh, eh, lh = base["hits_series"], ceil["hits_series"], learn["hits_series"]
@@ -378,6 +418,8 @@ def main():
     ap.add_argument("--train-frac", type=float, default=0.5)
     ap.add_argument("--warmup", type=float, default=0.05)
     ap.add_argument("--max-train", type=int, default=400_000, help="cap on training samples")
+    ap.add_argument("--sample-k", type=int, default=64,
+                    help="residents sampled per eviction for the current-age prediction (LRB=64)")
     ap.add_argument("--trees", type=int, default=200)
     ap.add_argument("--bar", type=float, default=8.0, help="pre-registered corridor bar (pts)")
     ap.add_argument("--min-capture", type=float, default=0.25,
@@ -391,6 +433,7 @@ def main():
 
     selftest()
     if args.selftest:
+        learned_demo(seed=args.seed)
         return
     if not args.trace:
         ap.error("give --trace PATH (or --trace SYNTH / SYNTHPOS), or --selftest only")
