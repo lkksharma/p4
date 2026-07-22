@@ -81,7 +81,7 @@ from collections import deque
 import numpy as np
 
 from p4_cache import NEVER
-from p4_evict import BeladyEvictor, S3FIFOEvictor
+from p4_evict import BeladyEvictor, LRUEvictor, S3FIFOEvictor
 from p4_prefetch import NoPrefetch, PFCache
 from p4_sweep import prep
 
@@ -207,18 +207,18 @@ def train_admission(trace, train_frac, max_train, trees, seed, nd):
     return clf, P, float(y.mean())
 
 
-def tune_admission_tau(trace, cap, P, train_frac, taus):
+def tune_admission_tau(trace, cap, P, train_frac, taus, base_policy="s3fifo"):
     """Pick the bypass threshold on the TRAIN half only (no test leakage): bypass a miss when the
-    predicted reuse probability is below tau. tau = 0 admits everything (identical to S3-FIFO), so
-    the tuned policy is bounded below by the baseline. Returns (best_tau, best_train_ohr)."""
+    predicted reuse probability is below tau. tau = 0 admits everything (identical to the base
+    evictor), so the tuned policy is bounded below by the baseline. Returns (best_tau, train_ohr)."""
     n = trace["n"]; cut = int(n * train_frac)
     sub = dict(obj_id=trace["obj_id"][:cut], size=trace["size"][:cut],
                next_vtime=trace["next_vtime"][:cut], n=cut)
     best = (0.0, -1.0)
     for tau in taus:
         mask = P[:cut] >= tau
-        r = replay(sub, cap, S3FIFOEvictor(cap), 0.05, mode="plain", return_hits=False,
-                   admit_mask=mask)
+        r = replay(sub, cap, _base_evictor(base_policy, cap), 0.05, mode="plain",
+                   return_hits=False, admit_mask=mask)
         if r["ohr"] > best[1]:
             best = (float(tau), r["ohr"])
     return best
@@ -357,18 +357,24 @@ def block_ci(diff, blocks=1000, resamples=10000, seed=0):
     return 100.0 * float(diff.mean()), float(lo), float(hi), float(boot.std(ddof=1))
 
 
-def _construction_check(trace, cap, pos, szs, warmup):
-    """The invariant: the local replay must reproduce PFCache's OHR EXACTLY for S3-FIFO and Belady.
-    Only then is the learned arm (which must use the local replay) on identical footing."""
-    b_pf = PFCache(cap, "s3fifo", NoPrefetch(), positions=pos, sizes=szs).run(trace, warmup_frac=warmup)
+def _base_evictor(policy, cap):
+    return LRUEvictor(cap) if policy == "lru" else S3FIFOEvictor(cap)
+
+
+def _construction_check(trace, cap, pos, szs, warmup, base_policy="s3fifo"):
+    """The invariant: the local replay must reproduce PFCache's OHR EXACTLY for the chosen baseline
+    and for Belady. Only then is the learned arm (which uses the local replay) on identical
+    footing. base_policy selects the deployable lower bound: 's3fifo' (2023, strong) or 'lru' (the
+    pre-learned-caching era baseline, for the LRB-style retrospective back-test)."""
+    b_pf = PFCache(cap, base_policy, NoPrefetch(), positions=pos, sizes=szs).run(trace, warmup_frac=warmup)
     e_pf = PFCache(cap, "belady", NoPrefetch(), positions=pos, sizes=szs).run(trace, warmup_frac=warmup)
-    b_me = replay(trace, cap, S3FIFOEvictor(cap), warmup, mode="plain", return_hits=True)
+    b_me = replay(trace, cap, _base_evictor(base_policy, cap), warmup, mode="plain", return_hits=True)
     e_me = replay(trace, cap, BeladyEvictor(cap, pos), warmup, mode="oracle", return_hits=True)
     ok_b = abs(b_me["ohr"] - b_pf["ohr"]) < 1e-9
     ok_e = abs(e_me["ohr"] - e_pf["ohr"]) < 1e-9
-    print(f"  CONSTRUCTION CHECK  S3-FIFO local {b_me['ohr']:.6f} vs PFCache {b_pf['ohr']:.6f}  "
+    print(f"  CONSTRUCTION CHECK  {base_policy:7s} local {b_me['ohr']:.6f} vs PFCache {b_pf['ohr']:.6f}  "
           f"{'OK' if ok_b else 'MISMATCH'}")
-    print(f"  CONSTRUCTION CHECK  Belady  local {e_me['ohr']:.6f} vs PFCache {e_pf['ohr']:.6f}  "
+    print(f"  CONSTRUCTION CHECK  belady  local {e_me['ohr']:.6f} vs PFCache {e_pf['ohr']:.6f}  "
           f"{'OK' if ok_e else 'MISMATCH'}")
     return (ok_b and ok_e), b_me, e_me
 
@@ -420,24 +426,25 @@ def run(trace, cap, pos, szs, args):
           "accept a learned cache policy?")
     print(LINE)
 
-    ok, base, ceil = _construction_check(trace, cap, pos, szs, warmup)
+    bp = args.baseline
+    ok, base, ceil = _construction_check(trace, cap, pos, szs, warmup, base_policy=bp)
     if not ok:
         print("  VERDICT: INVALID -- construction check failed; learned arm not comparable. Abort.")
         return None
 
     t0 = time.time()
-    if args.mode == "admit":                              # learned ADMISSION (Baleen-style, bounded by S3-FIFO)
+    if args.mode == "admit":                              # learned ADMISSION (Baleen-style, bounded by baseline)
         clf, P, base_rate = train_admission(trace, args.train_frac, args.max_train, args.trees,
                                             args.seed, args.deltas)
         taus = tuple(round(x, 2) for x in np.linspace(0.0, 0.9, 10))
-        tau, tr_ohr = tune_admission_tau(trace, cap, P, args.train_frac, taus)
+        tau, tr_ohr = tune_admission_tau(trace, cap, P, args.train_frac, taus, base_policy=bp)
         print(f"  [train] admission classifier x {args.deltas+2} features "
               f"({args.deltas}-step recency profile + freq + size), {args.trees} trees; "
               f"train reuse rate {base_rate:.3f}; tuned bypass tau={tau:.2f} "
               f"(train OHR {tr_ohr:.4f}) ({time.time()-t0:.1f}s)")
-        learn = replay(trace, cap, S3FIFOEvictor(cap), warmup, mode="plain", return_hits=True,
+        learn = replay(trace, cap, _base_evictor(bp, cap), warmup, mode="plain", return_hits=True,
                        admit_mask=(P >= tau), progress="learned-admit" if args.tqdm else None)
-        arm = f"S3-FIFO + learned admission (bypass tau={tau:.2f})"
+        arm = f"{bp} + learned admission (bypass tau={tau:.2f})"
     else:                                                 # learned EVICTION (LRB-style)
         model, n_train = train_model(trace, args.train_frac, args.max_train, args.trees, args.seed,
                                      nd=args.deltas)
@@ -457,14 +464,14 @@ def run(trace, cap, pos, szs, args):
     frac = cap_pt / corridor_pt if corridor_pt > 1e-9 else 0.0
     bhr_corr = 100 * (ceil["bhr"] - base["bhr"]); bhr_cap = 100 * (learn["bhr"] - base["bhr"])
 
-    print(f"  S3-FIFO (tuned baseline)   OHR {base['ohr']:.4f}   [deployable lower bound]")
+    print(f"  {bp.upper():7s} (baseline)        OHR {base['ohr']:.4f}   [deployable lower bound]")
     print(f"  BELADY  (mgmt ceiling)     OHR {ceil['ohr']:.4f}   [clairvoyant, not deployable]")
     print(f"  LEARNED                    OHR {learn['ohr']:.4f}   [{arm}; frozen, causal, deployable]")
     print("-" * 100)
     print(f"  CORRIDOR            {corridor_pt:+.2f} pts   95% CI [{c_lo:+.2f}, {c_hi:+.2f}]   "
-          f"(Belady - S3-FIFO; pre-registered bar >= {args.bar:.1f})")
+          f"(Belady - {bp}; pre-registered bar >= {args.bar:.1f})")
     print(f"  CAPTURED            {cap_pt:+.2f} pts   95% CI [{k_lo:+.2f}, {k_hi:+.2f}]   SE {k_se:.2f}   "
-          f"= {100*frac:.1f}% of the corridor (Learned - S3-FIFO)")
+          f"= {100*frac:.1f}% of the corridor (Learned - {bp})")
     print(f"  BYTE-WEIGHTED (BHR) corridor {bhr_corr:+.2f} pts   captured {bhr_cap:+.2f} pts")
 
     corridor_real = c_lo >= args.bar
@@ -500,8 +507,11 @@ def main():
     ap.add_argument("--warmup", type=float, default=0.05)
     ap.add_argument("--max-train", type=int, default=400_000, help="cap on training samples")
     ap.add_argument("--mode", choices=("admit", "evict"), default="admit",
-                    help="learned arm: 'admit' = S3-FIFO + learned admission (fast, bounded by "
+                    help="learned arm: 'admit' = baseline + learned admission (fast, bounded by "
                          "baseline); 'evict' = LRB-style learned evictor (slow, per-eviction)")
+    ap.add_argument("--baseline", choices=("s3fifo", "lru"), default="s3fifo",
+                    help="deployable lower bound: 's3fifo' (2023, strong) or 'lru' (pre-learned-"
+                         "caching era, for the LRB retrospective back-test)")
     ap.add_argument("--sample-k", type=int, default=64,
                     help="residents sampled per eviction for the current-age prediction (LRB=64)")
     ap.add_argument("--deltas", type=int, default=N_DELTAS,
