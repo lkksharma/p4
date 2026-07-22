@@ -76,6 +76,7 @@ from __future__ import annotations
 import argparse
 import math
 import time
+from collections import deque
 
 import numpy as np
 
@@ -85,7 +86,8 @@ from p4_prefetch import NoPrefetch, PFCache
 from p4_sweep import prep
 
 LINE = "=" * 100
-FEATS = 5  # [log1p(age=gap since last), log1p(freq), log1p(size), log1p(mean_interval), log1p(residency age)]
+N_DELTAS = 16                 # recency profile length: log gaps between the last N accesses (LRB's core signal)
+BIG_LOG = math.log1p(1e9)     # sentinel for a delta that does not exist (object seen fewer than N times)
 
 
 def synth_positive(n_req=150_000, n_hot=3000, hot_zipf=1.05, p_hot=0.5, cold_size=4, seed=0):
@@ -113,80 +115,86 @@ def synth_positive(n_req=150_000, n_hot=3000, hot_zipf=1.05, p_hot=0.5, cold_siz
 
 
 # ------------------------------------------------------------- feature construction (shared)
-def _feat_row(row, j, age, freq, size, mi, resid):
-    row[j, 0] = math.log1p(max(age, 0)); row[j, 1] = math.log1p(max(freq, 0))
-    row[j, 2] = math.log1p(max(size, 0)); row[j, 3] = math.log1p(max(mi, 0))
-    row[j, 4] = math.log1p(max(resid, 0))
+def _row(D, t, freq, size, nd):
+    """Feature row for an object with recent-access deque D (D[-1] = last access) evaluated at time
+    t: the recency profile log1p(delta_0 .. delta_{nd-1}), where delta_0 = t - last and delta_j is
+    the gap between the (j)th and (j+1)th most recent accesses (missing deltas -> BIG_LOG), then
+    log1p(frequency) and log1p(size). The delta PROFILE, not just the mean, is LRB's key signal: it
+    lets the model separate a one-hit-wonder (all deltas missing) from a genuinely reused object."""
+    r = [0.0] * (nd + 2)
+    prev = t; L = len(D)
+    for d in range(nd):
+        if d < L:
+            p = D[L - 1 - d]; g = prev - p
+            r[d] = math.log1p(g if g > 0 else 0); prev = p
+        else:
+            r[d] = BIG_LOG
+    r[nd] = math.log1p(max(freq, 0)); r[nd + 1] = math.log1p(max(size, 0))
+    return r
 
 
-def train_model(trace, train_frac, max_train, trees, seed):
+def train_model(trace, train_frac, max_train, trees, seed, nd=N_DELTAS):
     """Belady-imitation regressor on the trace PREFIX, trained on CENSORED samples so its input
-    distribution matches EVICTION time, not access time. At an access, an object is not evaluated
-    for eviction at the moment it is used, but at some later partial age while it waits; so for each
-    realised inter-access gap (la -> i) we draw a probe age in (0, i-la], set the features at that
-    partial age, and label = log1p(remaining distance = i - probe). One-shot objects (next use is
-    NEVER) also sit in the cache and must be evicted: for each such last access we draw a probe age
-    and label it log1p(n) (max distance), teaching the model to evict aged low-frequency objects.
-    Features are past-only (no leakage); the label uses the object's own next-access column."""
+    distribution matches EVICTION time, not access time. For each realised inter-access gap (la ->
+    i) we draw a probe age in (0, i-la], build the recency profile at that partial age, and label it
+    log1p(remaining distance = i - probe). One-shot objects (next use NEVER) also sit in the cache
+    and must be evicted: for each such last access we draw a probe age and label log1p(n) (max
+    distance). Features are past-only (no leakage); the label uses the object's own next-access
+    column, which is what supervised learning is."""
     from sklearn.ensemble import HistGradientBoostingRegressor
     ids, szs, nxt = trace["obj_id"], trace["size"], trace["next_vtime"]
     n = trace["n"]; cut = int(n * train_frac); NEVERv = int(NEVER)
-    rng = np.random.default_rng(seed)
-    HMAX = 100_000                                   # probe-age horizon for one-shot (never) samples
-    last, freq, first, size = {}, {}, {}, {}
-    rows = []                                        # each: (age, freq, size, mi, resid, label)
+    rng = np.random.default_rng(seed); HMAX = 100_000
+    hist, freq, size = {}, {}, {}
+    F, y = [], []
     for i in range(cut):
         o = int(ids[i]); s = int(szs[i]); f = freq.get(o, 0); nx = int(nxt[i])
-        if f > 0:                                    # a realised reuse gap la -> i: censored probe
-            la = last[o]; fi = first[o]; sz = size.get(o, s)
-            span = i - la; mi = (la - fi) / max(f - 1, 1)
+        D = hist.get(o)
+        if f > 0:                                    # censored probe inside the realised gap la -> i
+            la = D[-1]; span = i - la
             age = 1 + int(rng.integers(0, span)) if span > 0 else 0
-            rows.append((age, f, sz, mi, (la + age) - fi, math.log1p(max(span - age, 0))))
-        if nx >= NEVERv:                             # o's last appearance: a soon-to-be-dead resident
-            fi = first.get(o, i); f1 = f + 1; sz = s
-            mi = (i - fi) / max(f1 - 1, 1) if f1 > 1 else 0.0
+            F.append(_row(D, la + age, f, s, nd)); y.append(math.log1p(max(span - age, 0)))
+        if D is None:
+            D = deque(maxlen=nd); hist[o] = D
+        D.append(i)
+        if nx >= NEVERv:                             # last appearance: teach eviction of dead objects
             age = 1 + int(rng.integers(0, HMAX))
-            rows.append((age, f1, sz, mi, (i - fi) + age, math.log1p(n)))
-        freq[o] = f + 1; last[o] = i
-        first.setdefault(o, i); size[o] = s
-    arr = np.asarray(rows, dtype=np.float64)
-    if len(arr) > max_train:
-        arr = arr[rng.choice(len(arr), max_train, replace=False)]
-    X = np.empty((len(arr), FEATS), dtype=np.float64)
-    X[:, 0] = np.log1p(np.clip(arr[:, 0], 0, None)); X[:, 1] = np.log1p(np.clip(arr[:, 1], 0, None))
-    X[:, 2] = np.log1p(np.clip(arr[:, 2], 0, None)); X[:, 3] = np.log1p(np.clip(arr[:, 3], 0, None))
-    X[:, 4] = np.log1p(np.clip(arr[:, 4], 0, None))
-    y = arr[:, 5]
+            F.append(_row(D, i + age, f + 1, s, nd)); y.append(math.log1p(n))
+        freq[o] = f + 1; size[o] = s
+    idx = rng.choice(len(F), max_train, replace=False) if len(F) > max_train else np.arange(len(F))
+    X = np.asarray([F[k] for k in idx], dtype=np.float64)
+    yv = np.asarray([y[k] for k in idx], dtype=np.float64)
     m = HistGradientBoostingRegressor(max_iter=trees, learning_rate=0.1, max_leaf_nodes=31,
                                       min_samples_leaf=50, l2_regularization=1.0, random_state=seed)
-    m.fit(X, y)
-    return m, len(arr)
+    m.fit(X, yv)
+    return m, len(idx)
 
 
 # --------------------------------------------------------------------- the learned evictor
 class LearnedEvictor:
     """LRB-lite (LRB's actual recipe): at each eviction, predict the reuse distance of a RANDOM
-    SAMPLE of residents using their CURRENT features -- crucially age = now - last access -- and
-    evict the largest. Predicting at eviction time with the current age is what makes an imperfect
-    model self-correcting: a mispredicted object that sits unused keeps ageing, so its predicted
-    distance keeps growing and it becomes MORE evictable; a prediction frozen at access time instead
-    goes stale and traps the object forever. New objects join the resident pool immediately and are
-    ranked like any other (no probationary protection, which would let one-shot objects accumulate).
-    Sampling (LRB uses 64) makes each eviction O(K) rather than O(cache)."""
+    SAMPLE of residents using their CURRENT recency profile (delta_0 = now - last access) and evict
+    the largest. Predicting at eviction time with the current age is what makes an imperfect model
+    self-correcting: a mispredicted object that sits unused keeps ageing, so its predicted distance
+    keeps growing and it becomes MORE evictable; a prediction frozen at access time instead goes
+    stale and traps the object forever. New objects join the resident pool immediately (no
+    probationary protection, which would let one-shot objects accumulate). Sampling (LRB uses 64)
+    makes each eviction O(K) rather than O(cache)."""
     name = "learned"
 
-    def __init__(self, model, sample_k=64, seed=0):
-        self.model, self.K = model, sample_k
+    def __init__(self, model, nd=N_DELTAS, sample_k=64, seed=0):
+        self.model, self.ND, self.K = model, nd, sample_k
         self.rng = np.random.default_rng(seed)
-        self.last, self.freq, self.first, self.size = {}, {}, {}, {}
+        self.hist, self.freq, self.size = {}, {}, {}
         self.res, self.pos = [], {}                  # resident list + index map (O(1) swap-remove)
         self._t = 0                                  # current time, set by replay before eviction
 
     def _obs(self, o, t, s=None):
+        D = self.hist.get(o)
+        if D is None:
+            D = deque(maxlen=self.ND); self.hist[o] = D
+        D.append(t)
         self.freq[o] = self.freq.get(o, 0) + 1
-        self.last[o] = t
-        if o not in self.first:
-            self.first[o] = t
         if s is not None:
             self.size[o] = s
 
@@ -213,10 +221,8 @@ class LearnedEvictor:
         t = self._t
         cand = self.res if L <= self.K else [self.res[j]
                                              for j in np.unique(self.rng.integers(0, L, self.K))]
-        X = np.empty((len(cand), FEATS), dtype=np.float64)
-        for j, o in enumerate(cand):
-            la = self.last[o]; f = self.freq[o]; fi = self.first[o]
-            _feat_row(X, j, t - la, f, self.size.get(o, 1), (la - fi) / max(f - 1, 1), t - fi)
+        X = np.asarray([_row(self.hist[o], t, self.freq[o], self.size.get(o, 1), self.ND)
+                        for o in cand], dtype=np.float64)
         vo = cand[int(np.argmax(self.model.predict(X)))]   # largest predicted distance -> evict
         self._remove(vo)
         return vo
@@ -337,7 +343,7 @@ def learned_demo(seed=0):
     b = replay(tr, cap, S3FIFOEvictor(cap), 0.05, mode="plain")
     e = replay(tr, cap, BeladyEvictor(cap, pos), 0.05, mode="oracle")
     m, _ = train_model(tr, 0.5, 80_000, 120, seed)
-    lr = replay(tr, cap, LearnedEvictor(m, sample_k=64, seed=seed), 0.05, mode="learned")
+    lr = replay(tr, cap, LearnedEvictor(m, sample_k=64, seed=seed), 0.05, mode="learned")   # nd default
     corr = 100 * (e["ohr"] - b["ohr"]); capg = 100 * (lr["ohr"] - b["ohr"])
     print(f"[learned_demo] learnable workload: corridor {corr:+.2f} pts, deployable evictor "
           f"captures {capg:+.2f} pts ({100*capg/corr if corr > 0.1 else 0:.0f}%)  "
@@ -358,12 +364,15 @@ def run(trace, cap, pos, szs, args):
         return None
 
     t0 = time.time()
-    model, n_train = train_model(trace, args.train_frac, args.max_train, args.trees, args.seed)
-    print(f"  [train] LRB-lite on {n_train:,} censored samples x {FEATS} causal features, "
-          f"{args.trees} trees ({time.time()-t0:.1f}s); evicting on current-age predictions, "
-          f"current-age predictions over a {args.sample_k}-resident sample")
+    model, n_train = train_model(trace, args.train_frac, args.max_train, args.trees, args.seed,
+                                 nd=args.deltas)
+    print(f"  [train] LRB-lite on {n_train:,} censored samples x {args.deltas+2} features "
+          f"({args.deltas}-step recency profile + freq + size), {args.trees} trees "
+          f"({time.time()-t0:.1f}s); evicting on current-age predictions over a "
+          f"{args.sample_k}-resident sample")
 
-    learn = replay(trace, cap, LearnedEvictor(model, sample_k=args.sample_k, seed=args.seed),
+    learn = replay(trace, cap, LearnedEvictor(model, nd=args.deltas, sample_k=args.sample_k,
+                                              seed=args.seed),
                    warmup, mode="learned", return_hits=True,
                    progress="learned-evictor" if args.tqdm else None)
 
@@ -420,6 +429,8 @@ def main():
     ap.add_argument("--max-train", type=int, default=400_000, help="cap on training samples")
     ap.add_argument("--sample-k", type=int, default=64,
                     help="residents sampled per eviction for the current-age prediction (LRB=64)")
+    ap.add_argument("--deltas", type=int, default=N_DELTAS,
+                    help="recency-profile length: log gaps between the last N accesses (LRB core feature)")
     ap.add_argument("--trees", type=int, default=200)
     ap.add_argument("--bar", type=float, default=8.0, help="pre-registered corridor bar (pts)")
     ap.add_argument("--min-capture", type=float, default=0.25,
