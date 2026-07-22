@@ -170,6 +170,60 @@ def train_model(trace, train_frac, max_train, trees, seed, nd=N_DELTAS):
     return m, len(idx)
 
 
+# ------------------------------------------------------------------- learned ADMISSION (Baleen-style)
+def causal_reuse_features(trace, nd):
+    """Feature row for EVERY request position i, describing the object's state AS OF that access
+    (recency profile from its prior accesses, evaluated at t=i, plus prior frequency and size).
+    These features depend only on the request stream, NOT on cache state, so they can be built once
+    and batched -- which is what makes learned admission fast (one predict for the whole trace)."""
+    ids, szs = trace["obj_id"], trace["size"]; n = trace["n"]
+    hist, freq = {}, {}
+    X = np.empty((n, nd + 2), dtype=np.float64)
+    for i in range(n):
+        o = int(ids[i]); s = int(szs[i]); D = hist.get(o); f = freq.get(o, 0)
+        X[i] = _row(D if D is not None else (), i, f, s, nd)   # profile from PRIOR accesses, age = i - last
+        if D is None:
+            D = deque(maxlen=nd); hist[o] = D
+        D.append(i); freq[o] = f + 1
+    return X
+
+
+def train_admission(trace, train_frac, max_train, trees, seed, nd):
+    """Reuse classifier for ADMISSION: predict, at the moment an object is requested, whether it
+    will be requested AGAIN (next_vtime < NEVER). Bypassing objects predicted one-shot is the
+    Baleen-style lever that recovers the cache space S3-FIFO wastes on one-hit-wonders. Trained on
+    the prefix; then reuse probability is predicted for every position in one batched call."""
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    X = causal_reuse_features(trace, nd)
+    n = trace["n"]; cut = int(n * train_frac); NEVERv = int(NEVER)
+    y = (trace["next_vtime"][:cut].astype(np.int64) < NEVERv).astype(np.int32)
+    Xtr = X[:cut]
+    rng = np.random.default_rng(seed)
+    if len(Xtr) > max_train:
+        idx = rng.choice(len(Xtr), max_train, replace=False); Xtr, y = Xtr[idx], y[idx]
+    clf = HistGradientBoostingClassifier(max_iter=trees, learning_rate=0.1, random_state=seed)
+    clf.fit(Xtr, y)
+    P = clf.predict_proba(X)[:, 1]                        # reuse probability at every position
+    return clf, P, float(y.mean())
+
+
+def tune_admission_tau(trace, cap, P, train_frac, taus):
+    """Pick the bypass threshold on the TRAIN half only (no test leakage): bypass a miss when the
+    predicted reuse probability is below tau. tau = 0 admits everything (identical to S3-FIFO), so
+    the tuned policy is bounded below by the baseline. Returns (best_tau, best_train_ohr)."""
+    n = trace["n"]; cut = int(n * train_frac)
+    sub = dict(obj_id=trace["obj_id"][:cut], size=trace["size"][:cut],
+               next_vtime=trace["next_vtime"][:cut], n=cut)
+    best = (0.0, -1.0)
+    for tau in taus:
+        mask = P[:cut] >= tau
+        r = replay(sub, cap, S3FIFOEvictor(cap), 0.05, mode="plain", return_hits=False,
+                   admit_mask=mask)
+        if r["ohr"] > best[1]:
+            best = (float(tau), r["ohr"])
+    return best
+
+
 # --------------------------------------------------------------------- the learned evictor
 class LearnedEvictor:
     """LRB-lite (LRB's actual recipe): at each eviction, predict the reuse distance of a RANDOM
@@ -232,10 +286,14 @@ class LearnedEvictor:
 
 
 # ------------------------------------------------------------------ demand-only replay (local)
-def replay(trace, cap, ev, warmup_frac=0.05, mode="plain", return_hits=True, progress=None):
+def replay(trace, cap, ev, warmup_frac=0.05, mode="plain", return_hits=True, progress=None,
+           admit_mask=None):
     """Deterministic demand-only cache replay mirroring PFCache's no-prefetch path byte-for-byte.
     mode: 'plain' (ev.hit(o)), 'oracle' (ev.touch(o,i)), 'learned' (ev.hit(o,i)). All eviction is
-    heap-driven inside the evictor. Validated against PFCache in _construction_check()."""
+    heap-driven inside the evictor. Validated against PFCache in _construction_check().
+    admit_mask: optional bool array over positions; on a miss where admit_mask[i] is False the
+    object is served from origin but NOT cached (learned ADMISSION / bypass). None -> admit all,
+    which is exactly the base evictor (so a tuned admission policy is bounded below by it)."""
     ids, szs = trace["obj_id"], trace["size"]
     n = trace["n"]; warm = int(n * warmup_frac)
     cached = {}; used = 0
@@ -266,7 +324,8 @@ def replay(trace, cap, ev, warmup_frac=0.05, mode="plain", return_hits=True, pro
             else:
                 ev.hit(o)
         else:                                            # ---- MISS ----
-            if s <= cap:
+            bypass = admit_mask is not None and not admit_mask[i]
+            if s <= cap and not bypass:                  # bypass -> serve from origin, do not cache
                 if mode == "learned":
                     ev._t = i                            # eviction scores use the CURRENT age (now - last)
                 while used + s > cap and cached:
@@ -333,20 +392,23 @@ def selftest():
 
 
 def learned_demo(seed=0):
-    """--selftest extra: a small LEARNABLE workload proving the deployable evictor captures a
-    substantial, positive fraction of a real eviction corridor (the pipeline can green-light)."""
+    """--selftest extra: a small workload with one-hit-wonder pollution, proving the deployable
+    learned-ADMISSION policy captures a substantial, positive fraction of the corridor (the
+    pipeline can green-light) and is bounded below by S3-FIFO."""
     from p4_cache import footprint_bytes
     from p4_prefetch import build_obj_positions, build_obj_sizes
     tr = synth_positive(n_req=40_000, n_hot=800, seed=seed)
     cap = max(int(footprint_bytes(tr) * 0.01), 1)
-    pos = build_obj_positions(tr); szs = build_obj_sizes(tr)
+    pos = build_obj_positions(tr)
     b = replay(tr, cap, S3FIFOEvictor(cap), 0.05, mode="plain")
     e = replay(tr, cap, BeladyEvictor(cap, pos), 0.05, mode="oracle")
-    m, _ = train_model(tr, 0.5, 80_000, 120, seed)
-    lr = replay(tr, cap, LearnedEvictor(m, sample_k=64, seed=seed), 0.05, mode="learned")   # nd default
+    _, P, _ = train_admission(tr, 0.5, 80_000, 120, seed, N_DELTAS)
+    taus = tuple(round(x, 2) for x in np.linspace(0.0, 0.9, 10))
+    tau, _ = tune_admission_tau(tr, cap, P, 0.5, taus)
+    lr = replay(tr, cap, S3FIFOEvictor(cap), 0.05, mode="plain", admit_mask=(P >= tau))
     corr = 100 * (e["ohr"] - b["ohr"]); capg = 100 * (lr["ohr"] - b["ohr"])
-    print(f"[learned_demo] learnable workload: corridor {corr:+.2f} pts, deployable evictor "
-          f"captures {capg:+.2f} pts ({100*capg/corr if corr > 0.1 else 0:.0f}%)  "
+    print(f"[learned_demo] one-shot-polluted workload: corridor {corr:+.2f} pts, learned admission "
+          f"(tau={tau:.2f}) captures {capg:+.2f} pts ({100*capg/corr if corr > 0.1 else 0:.0f}%)  "
           f"[S3-FIFO {b['ohr']:.4f}  Belady {e['ohr']:.4f}  Learned {lr['ohr']:.4f}]")
 
 
@@ -354,8 +416,8 @@ def learned_demo(seed=0):
 def run(trace, cap, pos, szs, args):
     warmup = args.warmup
     print(LINE)
-    print("  EVICTION GREEN-LIGHT -- does the SAME instrument that rejects the prefetcher accept "
-          "a learned evictor?")
+    print("  CACHE-MANAGEMENT GREEN-LIGHT -- does the SAME instrument that rejects the prefetcher "
+          "accept a learned cache policy?")
     print(LINE)
 
     ok, base, ceil = _construction_check(trace, cap, pos, szs, warmup)
@@ -364,17 +426,28 @@ def run(trace, cap, pos, szs, args):
         return None
 
     t0 = time.time()
-    model, n_train = train_model(trace, args.train_frac, args.max_train, args.trees, args.seed,
-                                 nd=args.deltas)
-    print(f"  [train] LRB-lite on {n_train:,} censored samples x {args.deltas+2} features "
-          f"({args.deltas}-step recency profile + freq + size), {args.trees} trees "
-          f"({time.time()-t0:.1f}s); evicting on current-age predictions over a "
-          f"{args.sample_k}-resident sample")
-
-    learn = replay(trace, cap, LearnedEvictor(model, nd=args.deltas, sample_k=args.sample_k,
-                                              seed=args.seed),
-                   warmup, mode="learned", return_hits=True,
-                   progress="learned-evictor" if args.tqdm else None)
+    if args.mode == "admit":                              # learned ADMISSION (Baleen-style, bounded by S3-FIFO)
+        clf, P, base_rate = train_admission(trace, args.train_frac, args.max_train, args.trees,
+                                            args.seed, args.deltas)
+        taus = tuple(round(x, 2) for x in np.linspace(0.0, 0.9, 10))
+        tau, tr_ohr = tune_admission_tau(trace, cap, P, args.train_frac, taus)
+        print(f"  [train] admission classifier x {args.deltas+2} features "
+              f"({args.deltas}-step recency profile + freq + size), {args.trees} trees; "
+              f"train reuse rate {base_rate:.3f}; tuned bypass tau={tau:.2f} "
+              f"(train OHR {tr_ohr:.4f}) ({time.time()-t0:.1f}s)")
+        learn = replay(trace, cap, S3FIFOEvictor(cap), warmup, mode="plain", return_hits=True,
+                       admit_mask=(P >= tau), progress="learned-admit" if args.tqdm else None)
+        arm = f"S3-FIFO + learned admission (bypass tau={tau:.2f})"
+    else:                                                 # learned EVICTION (LRB-style)
+        model, n_train = train_model(trace, args.train_frac, args.max_train, args.trees, args.seed,
+                                     nd=args.deltas)
+        print(f"  [train] LRB-lite evictor on {n_train:,} censored samples x {args.deltas+2} "
+              f"features, {args.trees} trees ({time.time()-t0:.1f}s)")
+        learn = replay(trace, cap, LearnedEvictor(model, nd=args.deltas, sample_k=args.sample_k,
+                                                  seed=args.seed),
+                       warmup, mode="learned", return_hits=True,
+                       progress="learned-evictor" if args.tqdm else None)
+        arm = "learned evictor (LRB-style)"
 
     bh, eh, lh = base["hits_series"], ceil["hits_series"], learn["hits_series"]
     corridor_pt, c_lo, c_hi, _ = block_ci(eh.astype(np.float64) - bh.astype(np.float64),
@@ -385,11 +458,10 @@ def run(trace, cap, pos, szs, args):
     bhr_corr = 100 * (ceil["bhr"] - base["bhr"]); bhr_cap = 100 * (learn["bhr"] - base["bhr"])
 
     print(f"  S3-FIFO (tuned baseline)   OHR {base['ohr']:.4f}   [deployable lower bound]")
-    print(f"  BELADY  (eviction ceiling) OHR {ceil['ohr']:.4f}   [clairvoyant, not deployable]")
-    print(f"  LEARNED (frozen, causal)   OHR {learn['ohr']:.4f}   [deployable; trained on prefix, "
-          f"no future at decision time]")
+    print(f"  BELADY  (mgmt ceiling)     OHR {ceil['ohr']:.4f}   [clairvoyant, not deployable]")
+    print(f"  LEARNED                    OHR {learn['ohr']:.4f}   [{arm}; frozen, causal, deployable]")
     print("-" * 100)
-    print(f"  EVICTION CORRIDOR   {corridor_pt:+.2f} pts   95% CI [{c_lo:+.2f}, {c_hi:+.2f}]   "
+    print(f"  CORRIDOR            {corridor_pt:+.2f} pts   95% CI [{c_lo:+.2f}, {c_hi:+.2f}]   "
           f"(Belady - S3-FIFO; pre-registered bar >= {args.bar:.1f})")
     print(f"  CAPTURED            {cap_pt:+.2f} pts   95% CI [{k_lo:+.2f}, {k_hi:+.2f}]   SE {k_se:.2f}   "
           f"= {100*frac:.1f}% of the corridor (Learned - S3-FIFO)")
@@ -398,21 +470,21 @@ def run(trace, cap, pos, szs, args):
     corridor_real = c_lo >= args.bar
     captured = (k_lo > 0.0) and (frac >= args.min_capture)
     if corridor_real and captured:
-        verdict = (f"BUILD -- a large eviction corridor EXISTS and a deployable learned evictor "
-                   f"CAPTURES {100*frac:.0f}% of it ({cap_pt:+.2f} pts above the tuned baseline, "
-                   f"CI clear of 0). The instrument green-lights this component.")
+        verdict = (f"BUILD -- a large corridor EXISTS and a deployable {args.mode} policy CAPTURES "
+                   f"{100*frac:.0f}% of it ({cap_pt:+.2f} pts above the tuned baseline, CI clear of "
+                   f"0). The instrument green-lights this component.")
     elif corridor_real and not captured:
-        verdict = (f"REAL BUT NOT CAPTURED -- corridor clears the bar, but this evictor realises "
-                   f"only {100*frac:.0f}% (CI [{k_lo:+.2f},{k_hi:+.2f}]). Honest partial result.")
+        verdict = (f"REAL BUT NOT CAPTURED -- corridor clears the bar, but this {args.mode} policy "
+                   f"realises only {100*frac:.0f}% (CI [{k_lo:+.2f},{k_hi:+.2f}]). Honest partial result.")
     else:
-        verdict = (f"NO CORRIDOR -- eviction corridor below the {args.bar:.1f}-pt bar "
+        verdict = (f"NO CORRIDOR -- corridor below the {args.bar:.1f}-pt bar "
                    f"(CI lower {c_lo:+.2f}); nothing to build here.")
     print(f"  VERDICT: {verdict}")
     print(f"  CONTRAST: on this trace the deployable PREFETCH policy lands well BELOW the baseline "
-          f"(the endogenous-slack trap); the deployable EVICTION policy lands ABOVE it. Same "
+          f"(the endogenous-slack trap); this learned {args.mode} policy lands ABOVE it. Same "
           f"instrument, opposite decision -- across capabilities, not just workloads.")
     print(LINE)
-    return dict(base=base["ohr"], belady=ceil["ohr"], learned=learn["ohr"],
+    return dict(base=base["ohr"], belady=ceil["ohr"], learned=learn["ohr"], mode=args.mode,
                 corridor=corridor_pt, corridor_ci=(c_lo, c_hi), captured=cap_pt,
                 captured_ci=(k_lo, k_hi), frac=frac, corridor_bhr=bhr_corr, captured_bhr=bhr_cap,
                 verdict="build" if (corridor_real and captured) else
@@ -427,6 +499,9 @@ def main():
     ap.add_argument("--train-frac", type=float, default=0.5)
     ap.add_argument("--warmup", type=float, default=0.05)
     ap.add_argument("--max-train", type=int, default=400_000, help="cap on training samples")
+    ap.add_argument("--mode", choices=("admit", "evict"), default="admit",
+                    help="learned arm: 'admit' = S3-FIFO + learned admission (fast, bounded by "
+                         "baseline); 'evict' = LRB-style learned evictor (slow, per-eviction)")
     ap.add_argument("--sample-k", type=int, default=64,
                     help="residents sampled per eviction for the current-age prediction (LRB=64)")
     ap.add_argument("--deltas", type=int, default=N_DELTAS,
