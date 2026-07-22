@@ -143,6 +143,12 @@ def gate_a(trace, cap, pos, szs, args, preds=None):
     wctx = warm["origin_bytes"] / max(base_tx, 1)
     learn = 100 * (warm["ohr"] - rbar["ohr"])
     warm_dom = warm["ohr"] > rbar["ohr"] and wctx <= tx
+    # BYTE-WEIGHTED corridor: same three arms, scored by byte hit ratio (bhr) instead of OHR.
+    # PFCache already returns bhr, so this is a reporting addition, not a second run. Reviewers
+    # ask for both weightings because request-weighted and byte-weighted can disagree when object
+    # sizes are skewed; reporting the pair closes that gap.
+    corridor_bhr = 100 * (ceil["bhr"] - rbar["bhr"])
+    learn_bhr = 100 * (warm["bhr"] - rbar["bhr"])
 
     print(f"  TUNED A1 BAR        {nm} tau={tau} k={k}  OHR {rbar['ohr']:.4f} @{tx:.2f}x  "
           f"(precision {rbar['pf_precision']:.3f})")
@@ -152,7 +158,9 @@ def gate_a(trace, cap, pos, szs, args, preds=None):
           f"(cold hits {warm.get('pf_cold_hits', 0)}, expect 0)")
     print(f"  GROSS CORRIDOR      {corridor:+.2f} pts   (inflated by the cold slice -- diagnostic)")
     print(f"  LEARNABLE CORRIDOR  {learn:+.2f} pts at iso prefetch-bandwidth   "
-          f"[pre-registered bar: >= 8.00]  <-- the honest number")
+          f"[pre-registered bar: >= 8.00]  <-- the honest number (request-weighted OHR)")
+    print(f"  BYTE-WEIGHTED (BHR) gross corridor {corridor_bhr:+.2f} pts   learnable corridor "
+          f"{learn_bhr:+.2f} pts   (bar BHR {rbar['bhr']:.4f}, warm BHR {warm['bhr']:.4f})")
     print(f"  PARETO(learnable)   warm ceiling {'DOMINATES' if warm_dom else 'does NOT dominate'} "
           f"the bar")
     live = learn >= 8.0 and warm_dom
@@ -160,7 +168,8 @@ def gate_a(trace, cap, pos, szs, args, preds=None):
     print(LINE)
     return dict(bar=rbar["ohr"], pred=nm, tau=tau, k=k, ceiling=ceil["ohr"],
                 warm_ceiling=warm["ohr"], corridor=corridor, learnable=learn,
-                cold_pts=cold_pts, dominates=warm_dom, live=live)
+                bar_bhr=rbar["bhr"], warm_bhr=warm["bhr"], corridor_bhr=corridor_bhr,
+                learnable_bhr=learn_bhr, cold_pts=cold_pts, dominates=warm_dom, live=live)
 
 
 # ------------------------------------------------- GATE B: the interaction 2x2, replayed per trace
