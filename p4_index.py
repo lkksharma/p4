@@ -83,8 +83,12 @@ def make_keys(dist, n, seed):
 def rmi(keys, n_leaves):
     """Two-stage recursive model index. Stage 1: one linear model routes a key to a leaf. Stage 2:
     per-leaf linear model predicts position. Returns (pred, leaf_maxerr[per key]) where the
-    last-mile search window for a key is pred +/- leaf_maxerr. Trained on the keys only."""
+    last-mile search window for a key is pred +/- leaf_maxerr. Trained on the keys only.
+    Keys are normalised to [0,1] first (monotonic, so positions are unchanged) to keep the linear
+    fits well-conditioned even for huge integer keys such as hashed object IDs."""
     N = len(keys); pos = np.arange(N, dtype=np.float64)
+    span = float(keys[-1] - keys[0]) or 1.0
+    keys = (keys - keys[0]) / span                        # normalise; monotonic -> index unaffected
     a1, b1 = np.polyfit(keys, pos, 1)                     # root model: key -> approximate position
     leaf = np.clip(((a1 * keys + b1) / N * n_leaves).astype(np.int64), 0, n_leaves - 1)
     pred = np.empty(N, dtype=np.float64)
@@ -114,7 +118,18 @@ def probes(window):
 
 
 def run_dist(dist, n, n_leaves, seed, bar_frac):
-    keys = make_keys(dist, n, seed)
+    return run_keys(dist, make_keys(dist, n, seed), n_leaves, bar_frac)
+
+
+def keys_from_trace(path, limit):
+    """Real key set with no downloads: the sorted, distinct object IDs from an oracleGeneral trace
+    (hashed 64-bit identities). Turns the index check into 'real method, real keys'."""
+    from p4_cache import load_oracle_general
+    t = load_oracle_general(path, limit=limit)
+    return np.unique(t["obj_id"].astype(np.float64))
+
+
+def run_keys(label, keys, n_leaves, bar_frac):
     N = len(keys); pos = np.arange(N)
     base = math.ceil(math.log2(N))                       # binary search probes
     oracle = 1.0                                         # perfect index
@@ -131,7 +146,7 @@ def run_dist(dist, n, n_leaves, seed, bar_frac):
     frac = captured / corridor if corridor > 1e-9 else 0.0
     live = ok and frac >= bar_frac and captured > 0
 
-    print(f"  [{dist}]  N={N:,}  leaves={n_leaves:,}  median|err|={np.median(err):.1f}  "
+    print(f"  [{label}]  N={N:,}  leaves={n_leaves:,}  median|err|={np.median(err):.1f}  "
           f"p99|err|={np.percentile(err,99):.0f}  invariant={'OK' if ok else 'VIOLATED'}")
     print(f"     BASELINE binary search  {base:6.2f} probes   [tuned non-learned]")
     print(f"     ORACLE   perfect index  {oracle:6.2f} probes   [reachable: position = N*CDF(key)]")
@@ -140,7 +155,7 @@ def run_dist(dist, n, n_leaves, seed, bar_frac):
           f"= {100*frac:5.1f}% of it")
     print(f"     VERDICT: {'BUILD -- real, reachable gap the learned index captures.' if live else 'not captured / no corridor.'}")
     print("-" * 100)
-    return dict(dist=dist, base=base, oracle=oracle, learned=learned, corridor=corridor,
+    return dict(dist=label, base=base, oracle=oracle, learned=learned, corridor=corridor,
                 captured=captured, frac=frac, invariant=ok, live=live)
 
 
@@ -152,12 +167,20 @@ def main():
     ap.add_argument("--bar-frac", type=float, default=0.5,
                     help="pre-registered: BUILD needs the learned index to capture >= this fraction")
     ap.add_argument("--dists", default="uniform,lognormal,clustered")
+    ap.add_argument("--keys-from-trace", default=None,
+                    help="use REAL keys: the sorted distinct object IDs of an oracleGeneral trace")
+    ap.add_argument("--limit", type=int, default=2_000_000)
     args = ap.parse_args()
 
     print(LINE)
     print("  THE INSTRUMENT IN A SECOND DOMAIN -- learned indexes (does the ruler ever say BUILD?)")
     print(LINE)
-    out = [run_dist(d, args.n, args.leaves, args.seed, args.bar_frac) for d in args.dists.split(",")]
+    if args.keys_from_trace:
+        keys = keys_from_trace(args.keys_from_trace, args.limit)
+        label = args.keys_from_trace.split("/")[-1] + " (real object-ID keys)"
+        out = [run_keys(label, keys, args.leaves, args.bar_frac)]
+    else:
+        out = [run_dist(d, args.n, args.leaves, args.seed, args.bar_frac) for d in args.dists.split(",")]
 
     print("  SUMMARY (the same procedure, different verdicts):")
     for r in out:
