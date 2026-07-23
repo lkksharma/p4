@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import warnings
 
 import numpy as np
 
@@ -89,6 +90,7 @@ def rmi(keys, n_leaves):
     N = len(keys); pos = np.arange(N, dtype=np.float64)
     span = float(keys[-1] - keys[0]) or 1.0
     keys = (keys - keys[0]) / span                        # normalise; monotonic -> index unaffected
+    warnings.simplefilter("ignore")                       # ill-conditioned leaves -> constant-ish fit, harmless
     a1, b1 = np.polyfit(keys, pos, 1)                     # root model: key -> approximate position
     leaf = np.clip(((a1 * keys + b1) / N * n_leaves).astype(np.int64), 0, n_leaves - 1)
     pred = np.empty(N, dtype=np.float64)
@@ -123,10 +125,27 @@ def run_dist(dist, n, n_leaves, seed, bar_frac):
 
 def keys_from_trace(path, limit):
     """Real key set with no downloads: the sorted, distinct object IDs from an oracleGeneral trace
-    (hashed 64-bit identities). Turns the index check into 'real method, real keys'."""
+    (hashed 64-bit identities). Turns the index check into 'real method, real keys'. NOTE: hashed
+    IDs are near-uniform by construction (the easy case for a learned index); use SOSD natural-key
+    datasets for the realistic, harder distributions."""
     from p4_cache import load_oracle_general
     t = load_oracle_general(path, limit=limit)
     return np.unique(t["obj_id"].astype(np.float64))
+
+
+def keys_from_sosd(path, n_target):
+    """Real NATURAL keys: a SOSD benchmark dataset (books / osm_cellids / fb / wiki_ts), the
+    standard proving ground for learned indexes. SOSD binary format = uint64 count header, then
+    that many keys (uint32 or uint64, inferred from the filename). Strided-subsampled to n_target
+    (preserves the sorted CDF shape). No credentials needed to download these."""
+    with open(path, "rb") as f:
+        count = int(np.fromfile(f, dtype=np.uint64, count=1)[0])
+        dt = np.uint32 if "uint32" in path else np.uint64
+        arr = np.fromfile(f, dtype=dt, count=count)
+    arr = np.unique(arr)                                  # sorted + distinct
+    if len(arr) > n_target:
+        arr = arr[np.linspace(0, len(arr) - 1, n_target).astype(np.int64)]
+    return arr.astype(np.float64)
 
 
 def run_keys(label, keys, n_leaves, bar_frac):
@@ -169,13 +188,19 @@ def main():
     ap.add_argument("--dists", default="uniform,lognormal,clustered")
     ap.add_argument("--keys-from-trace", default=None,
                     help="use REAL keys: the sorted distinct object IDs of an oracleGeneral trace")
+    ap.add_argument("--keys-from-sosd", default=None,
+                    help="use REAL NATURAL keys: a SOSD dataset file (books/osm/fb/wiki_ts)")
     ap.add_argument("--limit", type=int, default=2_000_000)
     args = ap.parse_args()
 
     print(LINE)
     print("  THE INSTRUMENT IN A SECOND DOMAIN -- learned indexes (does the ruler ever say BUILD?)")
     print(LINE)
-    if args.keys_from_trace:
+    if args.keys_from_sosd:
+        keys = keys_from_sosd(args.keys_from_sosd, args.limit)
+        label = args.keys_from_sosd.split("/")[-1] + " (SOSD natural keys)"
+        out = [run_keys(label, keys, args.leaves, args.bar_frac)]
+    elif args.keys_from_trace:
         keys = keys_from_trace(args.keys_from_trace, args.limit)
         label = args.keys_from_trace.split("/")[-1] + " (real object-ID keys)"
         out = [run_keys(label, keys, args.leaves, args.bar_frac)]
