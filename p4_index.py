@@ -203,6 +203,26 @@ def interpolation_lines(keys, q_idx, cl, max_probes=96):
     return lines
 
 
+def window_dist(window, cl):
+    """Distribution of last-mile search windows, in CACHE LINES, plus the mean lines actually
+    charged. This is the diagnostic that explains a probes-vs-lines disagreement.
+
+    The window is set by each leaf's MAX error, not its median, so a single badly-fit key drags
+    every key in its leaf. Two consequences this measures directly:
+      * SATURATION: any window <= cl fits in ONE line, so tightening it further is invisible to the
+        cache-line metric while probes (which count log2(window) comparisons) keep improving. A
+        model whose bulk is already sub-line gains nothing here from more capacity.
+      * TAIL DOMINANCE: the mean is carried by the few keys in badly-fit leaves. If the >64-line
+        share is flat as leaves increase, added capacity is fixing the bulk (invisible) and not the
+        tail (what the mean is made of) -- which is exactly a probes-BUILD / lines-miss signature.
+    """
+    wl = np.maximum(window / cl, 1.0)
+    charged = np.minimum(np.ceil(wl), np.maximum(1.0, np.ceil(np.log2(np.maximum(wl, 2.0)))))
+    return dict(one=float((wl <= 1).mean()), few=float(((wl > 1) & (wl <= 8)).mean()),
+                many=float(((wl > 8) & (wl <= 64)).mean()), tail=float((wl > 64).mean()),
+                charged=float(charged.mean()))
+
+
 def btree_probes(n, fanout):
     """Node accesses for a cache-resident B-tree of the given fanout: ceil(log_fanout N).
 
@@ -301,7 +321,13 @@ def run_keys(label, keys, n_leaves, bar_frac, fanout=16, sample=50_000, seed=0, 
           f"interpolation {interp:5.2f}  (measured, n={len(q_idx):,})")
     print(f"     BASELINE = best of family: {base:6.2f} probes   [{winner}]")
     print(f"     RMI leaf sweep (capped at N/{cap_div} = {max(1, N//cap_div):,} leaves):  "
-          + " | ".join(f"{g:,}:{p:.2f}" for p, g, _, _, _ in sweep))
+          + " | ".join(f"{g:,}:{p:.2f}p/{window_dist(w, cl)['tail']:.0%}tail"
+                       for p, g, _, w, _ in sweep)
+          + "   [probes / share of keys whose window spans >64 cache lines]")
+    wd = window_dist(window, cl)
+    print(f"     WINDOW DIST (tuned model, {cl} keys/line):  <=1 line {wd['one']:5.1%} | "
+          f"2-8 {wd['few']:5.1%} | 9-64 {wd['many']:5.1%} | >64 {wd['tail']:5.1%}   "
+          f"-> {wd['charged']:.2f} lines charged per lookup")
     print(f"     ORACLE   perfect index    {oracle:6.2f} probes   [reachable: position = N*CDF(key)]")
     print(f"     LEARNED  RMI (keys only)  {learned:6.2f} probes   [deployable, TUNED: "
           f"{best_leaves:,} leaves]")
