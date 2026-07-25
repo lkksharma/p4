@@ -119,8 +119,92 @@ def probes(window):
     return np.maximum(1.0, np.ceil(np.log2(np.maximum(window, 1.0))))
 
 
-def run_dist(dist, n, n_leaves, seed, bar_frac):
-    return run_keys(dist, make_keys(dist, n, seed), n_leaves, bar_frac)
+def interpolation_probes(keys, q_idx, max_probes=96):
+    """MEASURED probe count for interpolation search, simulated key by key (vectorised over a
+    query sample). Counts an actual probe every time the algorithm reads keys[p].
+
+    Why this baseline is mandatory, not optional. Interpolation search exploits EXACTLY the signal
+    this study credits to the learned index -- that position is approximately N*CDF(key) -- and it
+    does so with no model, no training, and no space. On a smooth key distribution it runs in
+    O(log log N) probes against binary search's O(log N). Omitting it and calling binary search
+    "the tuned non-learned baseline" is the same under-tuned-baseline error the caching half of this
+    paper exists to catch, so the index arm has to face it or the BUILD verdict is not earned."""
+    N = len(keys)
+    q = keys[q_idx].astype(np.float64)
+    lo = np.zeros(len(q), dtype=np.int64)
+    hi = np.full(len(q), N - 1, dtype=np.int64)
+    cnt = np.zeros(len(q), dtype=np.int64)
+    done = np.zeros(len(q), dtype=bool)
+    for _ in range(max_probes):
+        act = ~done
+        if not act.any():
+            break
+        klo, khi = keys[lo], keys[hi]
+        den = khi - klo
+        frac = np.where(den > 0, (q - klo) / np.where(den > 0, den, 1.0), 0.0)
+        frac = np.clip(frac, 0.0, 1.0)
+        p = lo + (frac * (hi - lo)).astype(np.int64)
+        p = np.clip(p, lo, hi)
+        cnt += act
+        kp = keys[p]
+        hit = act & (kp == q)
+        done |= hit
+        right = act & ~hit & (kp < q)
+        left = act & ~hit & (kp > q)
+        lo = np.where(right, p + 1, lo)
+        hi = np.where(left, p - 1, hi)
+        done |= act & ~hit & (lo > hi)          # range exhausted (cannot happen for present keys)
+    return cnt
+
+
+def interpolation_lines(keys, q_idx, cl, max_probes=96):
+    """Distinct CACHE LINES touched by interpolation search (`cl` keys per line).
+
+    Probe counts and cache-line counts are different units and they do not rank these structures
+    the same way, which matters because the RMI's last-mile search over a small window may touch a
+    single line while costing log2(window) comparisons. Charging comparisons to one arm and line
+    fetches to another is the unit error that decides this comparison, so both are measured."""
+    N = len(keys)
+    q = keys[q_idx].astype(np.float64)
+    lo = np.zeros(len(q), dtype=np.int64)
+    hi = np.full(len(q), N - 1, dtype=np.int64)
+    lines = np.zeros(len(q), dtype=np.int64)
+    last = np.full(len(q), -1, dtype=np.int64)
+    done = np.zeros(len(q), dtype=bool)
+    for _ in range(max_probes):
+        act = ~done
+        if not act.any():
+            break
+        klo, khi = keys[lo], keys[hi]
+        den = khi - klo
+        frac = np.clip(np.where(den > 0, (q - klo) / np.where(den > 0, den, 1.0), 0.0), 0.0, 1.0)
+        p = np.clip(lo + (frac * (hi - lo)).astype(np.int64), lo, hi)
+        blk = p // cl
+        lines += act & (blk != last)          # a repeat visit to the same line is free
+        last = np.where(act, blk, last)
+        kp = keys[p]
+        hit = act & (kp == q)
+        done |= hit
+        right = act & ~hit & (kp < q)
+        left = act & ~hit & (kp > q)
+        lo = np.where(right, p + 1, lo)
+        hi = np.where(left, p - 1, hi)
+        done |= act & ~hit & (lo > hi)
+    return lines
+
+
+def btree_probes(n, fanout):
+    """Node accesses for a cache-resident B-tree of the given fanout: ceil(log_fanout N).
+
+    One node occupies one cache line, so one node access is one memory probe -- the same unit the
+    RMI's last-mile search is counted in. With 8-byte keys and 64-byte lines a fanout of 8-16 is
+    the standard cache-optimised setting, which is why 'a B-tree costs the same as binary search'
+    holds for COMPARISONS but not for PROBES, the metric used here."""
+    return math.ceil(math.log(n, fanout))
+
+
+def run_dist(dist, n, n_leaves, seed, bar_frac, fanout=16):
+    return run_keys(dist, make_keys(dist, n, seed), n_leaves, bar_frac, fanout)
 
 
 def keys_from_trace(path, limit):
@@ -148,10 +232,18 @@ def keys_from_sosd(path, n_target):
     return arr.astype(np.float64)
 
 
-def run_keys(label, keys, n_leaves, bar_frac):
+def run_keys(label, keys, n_leaves, bar_frac, fanout=16, sample=50_000, seed=0):
     N = len(keys); pos = np.arange(N)
-    base = math.ceil(math.log2(N))                       # binary search probes
     oracle = 1.0                                         # perfect index
+
+    # ---- the non-learned FAMILY, swept; the baseline is the best of it (Instrument step 1) ----
+    binary = float(math.ceil(math.log2(N)))
+    btree = float(btree_probes(N, fanout))
+    rng = np.random.default_rng(seed)
+    q_idx = rng.choice(N, size=min(sample, N), replace=False)
+    interp = float(interpolation_probes(keys, q_idx).mean())
+    base = min(binary, btree, interp)
+    winner = {binary: "binary", btree: f"btree(B={fanout})", interp: "interpolation"}[base]
 
     pred, leaf_maxerr, err = rmi(keys, n_leaves)
     # correctness invariant: the true position must lie inside the declared search window
@@ -165,17 +257,47 @@ def run_keys(label, keys, n_leaves, bar_frac):
     frac = captured / corridor if corridor > 1e-9 else 0.0
     live = ok and frac >= bar_frac and captured > 0
 
+    naive_frac = (binary - learned) / (binary - oracle) if binary > oracle else 0.0
+
+    # ---- SECOND UNIT: distinct cache lines touched (cl keys per 64-byte line) ----
+    cl = max(1, 64 // 8)
+    binary_L = float(max(1.0, math.ceil(math.log2(max(N / cl, 2)))))   # last log2(cl) levels are free
+    btree_L = float(math.ceil(math.log(N, cl)))                        # one node = one line
+    interp_L = float(interpolation_lines(keys, q_idx, cl).mean())
+    # RMI: root params + leaf params + the last-mile cost, where the implementation is credited
+    # with whichever last-mile strategy is cheaper -- a linear scan of the window's lines, or a
+    # binary search within it. Charging only the scan would penalise the wide-window cases unfairly.
+    wl = np.maximum(window / cl, 1.0)
+    learned_L = float(2.0 + np.minimum(np.ceil(wl),
+                                       np.maximum(1.0, np.ceil(np.log2(np.maximum(wl, 2.0))))).mean())
+    base_L = min(binary_L, btree_L, interp_L)
+    winner_L = {binary_L: "binary", btree_L: f"btree(B={cl})", interp_L: "interpolation"}[base_L]
+    frac_L = (base_L - learned_L) / (base_L - 1.0) if base_L > 1.0 else 0.0
+    live_L = ok and frac_L >= bar_frac and (base_L - learned_L) > 0
+
     print(f"  [{label}]  N={N:,}  leaves={n_leaves:,}  median|err|={np.median(err):.1f}  "
           f"p99|err|={np.percentile(err,99):.0f}  invariant={'OK' if ok else 'VIOLATED'}")
-    print(f"     BASELINE binary search  {base:6.2f} probes   [tuned non-learned]")
-    print(f"     ORACLE   perfect index  {oracle:6.2f} probes   [reachable: position = N*CDF(key)]")
-    print(f"     LEARNED  RMI (trained on keys only) {learned:6.2f} probes   [deployable]")
+    print(f"     non-learned family:  binary {binary:5.2f} | btree(B={fanout}) {btree:5.2f} | "
+          f"interpolation {interp:5.2f}  (measured, n={len(q_idx):,})")
+    print(f"     BASELINE = best of family: {base:6.2f} probes   [{winner}]")
+    print(f"     ORACLE   perfect index    {oracle:6.2f} probes   [reachable: position = N*CDF(key)]")
+    print(f"     LEARNED  RMI (keys only)  {learned:6.2f} probes   [deployable]")
     print(f"     CORRIDOR {corridor:6.2f} probes    CAPTURED {captured:6.2f} probes "
           f"= {100*frac:5.1f}% of it")
-    print(f"     VERDICT: {'BUILD -- real, reachable gap the learned index captures.' if live else 'not captured / no corridor.'}")
+    print(f"     (against binary search alone the capture would read {100*naive_frac:5.1f}% -- "
+          f"the under-tuned-baseline number)")
+    print(f"     CACHE-LINE unit: binary {binary_L:5.2f} | btree(B={cl}) {btree_L:5.2f} | "
+          f"interp {interp_L:5.2f} | RMI {learned_L:5.2f}  -> base {base_L:5.2f} [{winner_L}], "
+          f"captured {100*frac_L:6.1f}%")
+    v = "BUILD" if live else "NOT captured"
+    vL = "BUILD" if live_L else "NOT captured"
+    print(f"     VERDICT  probes: {v}   |   cache lines: {vL}"
+          + ("   *** UNIT-DEPENDENT ***" if live != live_L else ""))
     print("-" * 100)
-    return dict(dist=label, base=base, oracle=oracle, learned=learned, corridor=corridor,
-                captured=captured, frac=frac, invariant=ok, live=live)
+    return dict(dist=label, base=base, binary=binary, btree=btree, interp=interp, winner=winner,
+                oracle=oracle, learned=learned, corridor=corridor, captured=captured, frac=frac,
+                naive_frac=naive_frac, invariant=ok, live=live,
+                base_L=base_L, learned_L=learned_L, frac_L=frac_L, live_L=live_L, winner_L=winner_L)
 
 
 def main():
@@ -191,6 +313,8 @@ def main():
     ap.add_argument("--keys-from-sosd", default=None,
                     help="use REAL NATURAL keys: a SOSD dataset file (books/osm/fb/wiki_ts)")
     ap.add_argument("--limit", type=int, default=2_000_000)
+    ap.add_argument("--fanout", type=int, default=16,
+                    help="B-tree fanout (keys per cache line); 16 = 4-byte keys on a 64-byte line")
     args = ap.parse_args()
 
     print(LINE)
@@ -199,19 +323,21 @@ def main():
     if args.keys_from_sosd:
         keys = keys_from_sosd(args.keys_from_sosd, args.limit)
         label = args.keys_from_sosd.split("/")[-1] + " (SOSD natural keys)"
-        out = [run_keys(label, keys, args.leaves, args.bar_frac)]
+        out = [run_keys(label, keys, args.leaves, args.bar_frac, args.fanout)]
     elif args.keys_from_trace:
         keys = keys_from_trace(args.keys_from_trace, args.limit)
         label = args.keys_from_trace.split("/")[-1] + " (real object-ID keys)"
-        out = [run_keys(label, keys, args.leaves, args.bar_frac)]
+        out = [run_keys(label, keys, args.leaves, args.bar_frac, args.fanout)]
     else:
-        out = [run_dist(d, args.n, args.leaves, args.seed, args.bar_frac) for d in args.dists.split(",")]
+        out = [run_dist(d, args.n, args.leaves, args.seed, args.bar_frac, args.fanout)
+               for d in args.dists.split(",")]
 
     print("  SUMMARY (the same procedure, different verdicts):")
     for r in out:
         tag = "BUILD" if r["live"] else "weak/no"
-        print(f"    {r['dist']:10s} corridor {r['corridor']:5.2f} probes, captured "
-              f"{100*r['frac']:5.1f}%  -> {tag}")
+        print(f"    {r['dist']:34s} base {r['base']:5.2f} ({r['winner']:14s}) corridor "
+              f"{r['corridor']:5.2f}, captured {100*r['frac']:6.1f}%  -> {tag}"
+              f"   [vs binary alone: {100*r['naive_frac']:5.1f}%]")
     print("  Contrast with caching: there the oracle needs the FUTURE (unreachable) and no "
           "deployable\n  policy captures the corridor; here the oracle needs only the KEYS "
           "(reachable) and the\n  learned index captures it. The reachability restriction is what "
