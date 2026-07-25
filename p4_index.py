@@ -86,31 +86,41 @@ def rmi(keys, n_leaves):
     per-leaf linear model predicts position. Returns (pred, leaf_maxerr[per key]) where the
     last-mile search window for a key is pred +/- leaf_maxerr. Trained on the keys only.
     Keys are normalised to [0,1] first (monotonic, so positions are unchanged) to keep the linear
-    fits well-conditioned even for huge integer keys such as hashed object IDs."""
+    fits well-conditioned even for huge integer keys such as hashed object IDs.
+
+    Vectorised: the per-leaf least-squares fits are computed with segmented sums (np.bincount) in
+    O(N) rather than by looping over leaves in Python (which was O(n_leaves * N) and made a leaf
+    sweep infeasible). A sweep is required, not optional: tuning the non-learned baseline family
+    while leaving the learned model at one fixed capacity is the same under-tuning error this paper
+    is about, pointed the other way. Both sides must be swept."""
     N = len(keys); pos = np.arange(N, dtype=np.float64)
     span = float(keys[-1] - keys[0]) or 1.0
     keys = (keys - keys[0]) / span                        # normalise; monotonic -> index unaffected
     warnings.simplefilter("ignore")                       # ill-conditioned leaves -> constant-ish fit, harmless
     a1, b1 = np.polyfit(keys, pos, 1)                     # root model: key -> approximate position
     leaf = np.clip(((a1 * keys + b1) / N * n_leaves).astype(np.int64), 0, n_leaves - 1)
-    pred = np.empty(N, dtype=np.float64)
-    for L in range(n_leaves):
-        m = leaf == L
-        c = int(m.sum())
-        if c == 0:
-            continue
-        if c == 1 or np.ptp(keys[m]) == 0:               # degenerate leaf: constant model
-            pred[m] = pos[m].mean()
-        else:
-            a, b = np.polyfit(keys[m], pos[m], 1)
-            pred[m] = a * keys[m] + b
+
+    # segmented least squares: per-leaf slope/intercept from grouped sums
+    M = n_leaves
+    cnt = np.bincount(leaf, minlength=M).astype(np.float64)
+    sx = np.bincount(leaf, weights=keys, minlength=M)
+    sy = np.bincount(leaf, weights=pos, minlength=M)
+    sxx = np.bincount(leaf, weights=keys * keys, minlength=M)
+    sxy = np.bincount(leaf, weights=keys * pos, minlength=M)
+    den = cnt * sxx - sx * sx
+    safe = den > 1e-12                                    # else degenerate leaf -> constant model
+    a = np.zeros(M); b = np.zeros(M)
+    a[safe] = (cnt[safe] * sxy[safe] - sx[safe] * sy[safe]) / den[safe]
+    b[safe] = (sy[safe] - a[safe] * sx[safe]) / cnt[safe]
+    nz = cnt > 0
+    b[~safe & nz] = sy[~safe & nz] / cnt[~safe & nz]       # constant fit = mean position
+    pred = a[leaf] * keys + b[leaf]
+
     # per-leaf guaranteed error: the window a lookup must search to be correct
-    leaf_maxerr = np.zeros(N, dtype=np.float64)
     err = np.abs(pred - pos)
-    for L in range(n_leaves):
-        m = leaf == L
-        if m.any():
-            leaf_maxerr[m] = err[m].max()
+    lmax = np.zeros(M)
+    np.maximum.at(lmax, leaf, err)
+    leaf_maxerr = lmax[leaf]
     return pred, leaf_maxerr, err
 
 
@@ -203,8 +213,8 @@ def btree_probes(n, fanout):
     return math.ceil(math.log(n, fanout))
 
 
-def run_dist(dist, n, n_leaves, seed, bar_frac, fanout=16):
-    return run_keys(dist, make_keys(dist, n, seed), n_leaves, bar_frac, fanout)
+def run_dist(dist, n, n_leaves, seed, bar_frac, fanout=16, cap_div=16):
+    return run_keys(dist, make_keys(dist, n, seed), n_leaves, bar_frac, fanout, cap_div=cap_div)
 
 
 def keys_from_trace(path, limit):
@@ -232,7 +242,7 @@ def keys_from_sosd(path, n_target):
     return arr.astype(np.float64)
 
 
-def run_keys(label, keys, n_leaves, bar_frac, fanout=16, sample=50_000, seed=0):
+def run_keys(label, keys, n_leaves, bar_frac, fanout=16, sample=50_000, seed=0, cap_div=16):
     N = len(keys); pos = np.arange(N)
     oracle = 1.0                                         # perfect index
 
@@ -245,12 +255,22 @@ def run_keys(label, keys, n_leaves, bar_frac, fanout=16, sample=50_000, seed=0):
     base = min(binary, btree, interp)
     winner = {binary: "binary", btree: f"btree(B={fanout})", interp: "interpolation"}[base]
 
-    pred, leaf_maxerr, err = rmi(keys, n_leaves)
-    # correctness invariant: the true position must lie inside the declared search window
-    lo = np.floor(pred - leaf_maxerr); hi = np.ceil(pred + leaf_maxerr)
-    ok = bool(np.all((pos >= lo) & (pos <= hi)))
-    window = 2.0 * leaf_maxerr + 1.0
-    learned = float(probes(window).mean())              # avg probes per lookup (last-mile search)
+    # ---- the LEARNED model, ALSO swept (Instrument step 1, applied symmetrically) ----
+    # Sweeping the non-learned family while pinning the RMI at one capacity would be the same
+    # under-tuned-baseline error this paper indicts, aimed the other way. The cap is N//cap_div
+    # leaves so the model stays an INDEX rather than becoming a position lookup table: at fanout 16
+    # a B-tree already carries ~N/16 internal entries, so an RMI of ~N/16 leaves is the
+    # space-comparable opponent, not a free win bought with memory.
+    grid = sorted({g for g in ([n_leaves] if n_leaves else []) + [1_000, 10_000, 100_000,
+                               max(1, N // cap_div)] if 1 <= g <= max(1, N // cap_div)})
+    sweep = []
+    for g in grid:
+        p_g, lme_g, e_g = rmi(keys, g)
+        lo_g = np.floor(p_g - lme_g); hi_g = np.ceil(p_g + lme_g)
+        ok_g = bool(np.all((pos >= lo_g) & (pos <= hi_g)))
+        w_g = 2.0 * lme_g + 1.0
+        sweep.append((float(probes(w_g).mean()), g, ok_g, w_g, e_g))
+    learned, best_leaves, ok, window, err = min(sweep, key=lambda t: t[0])
 
     corridor = base - oracle
     captured = base - learned
@@ -275,13 +295,16 @@ def run_keys(label, keys, n_leaves, bar_frac, fanout=16, sample=50_000, seed=0):
     frac_L = (base_L - learned_L) / (base_L - 1.0) if base_L > 1.0 else 0.0
     live_L = ok and frac_L >= bar_frac and (base_L - learned_L) > 0
 
-    print(f"  [{label}]  N={N:,}  leaves={n_leaves:,}  median|err|={np.median(err):.1f}  "
+    print(f"  [{label}]  N={N:,}  median|err|={np.median(err):.1f}  "
           f"p99|err|={np.percentile(err,99):.0f}  invariant={'OK' if ok else 'VIOLATED'}")
     print(f"     non-learned family:  binary {binary:5.2f} | btree(B={fanout}) {btree:5.2f} | "
           f"interpolation {interp:5.2f}  (measured, n={len(q_idx):,})")
     print(f"     BASELINE = best of family: {base:6.2f} probes   [{winner}]")
+    print(f"     RMI leaf sweep (capped at N/{cap_div} = {max(1, N//cap_div):,} leaves):  "
+          + " | ".join(f"{g:,}:{p:.2f}" for p, g, _, _, _ in sweep))
     print(f"     ORACLE   perfect index    {oracle:6.2f} probes   [reachable: position = N*CDF(key)]")
-    print(f"     LEARNED  RMI (keys only)  {learned:6.2f} probes   [deployable]")
+    print(f"     LEARNED  RMI (keys only)  {learned:6.2f} probes   [deployable, TUNED: "
+          f"{best_leaves:,} leaves]")
     print(f"     CORRIDOR {corridor:6.2f} probes    CAPTURED {captured:6.2f} probes "
           f"= {100*frac:5.1f}% of it")
     print(f"     (against binary search alone the capture would read {100*naive_frac:5.1f}% -- "
@@ -296,7 +319,7 @@ def run_keys(label, keys, n_leaves, bar_frac, fanout=16, sample=50_000, seed=0):
     print("-" * 100)
     return dict(dist=label, base=base, binary=binary, btree=btree, interp=interp, winner=winner,
                 oracle=oracle, learned=learned, corridor=corridor, captured=captured, frac=frac,
-                naive_frac=naive_frac, invariant=ok, live=live,
+                naive_frac=naive_frac, invariant=ok, live=live, best_leaves=best_leaves,
                 base_L=base_L, learned_L=learned_L, frac_L=frac_L, live_L=live_L, winner_L=winner_L)
 
 
@@ -315,6 +338,10 @@ def main():
     ap.add_argument("--limit", type=int, default=2_000_000)
     ap.add_argument("--fanout", type=int, default=16,
                     help="B-tree fanout (keys per cache line); 16 = 4-byte keys on a 64-byte line")
+    ap.add_argument("--cap-div", type=int, default=16,
+                    help="RMI leaf sweep cap = N/cap_div. Keeps the learned model space-comparable "
+                         "to the B-tree it races (which carries ~N/fanout internal entries) instead "
+                         "of degenerating into a position lookup table.")
     args = ap.parse_args()
 
     print(LINE)
@@ -323,13 +350,14 @@ def main():
     if args.keys_from_sosd:
         keys = keys_from_sosd(args.keys_from_sosd, args.limit)
         label = args.keys_from_sosd.split("/")[-1] + " (SOSD natural keys)"
-        out = [run_keys(label, keys, args.leaves, args.bar_frac, args.fanout)]
+        out = [run_keys(label, keys, args.leaves, args.bar_frac, args.fanout, cap_div=args.cap_div)]
     elif args.keys_from_trace:
         keys = keys_from_trace(args.keys_from_trace, args.limit)
         label = args.keys_from_trace.split("/")[-1] + " (real object-ID keys)"
-        out = [run_keys(label, keys, args.leaves, args.bar_frac, args.fanout)]
+        out = [run_keys(label, keys, args.leaves, args.bar_frac, args.fanout, cap_div=args.cap_div)]
     else:
-        out = [run_dist(d, args.n, args.leaves, args.seed, args.bar_frac, args.fanout)
+        out = [run_dist(d, args.n, args.leaves, args.seed, args.bar_frac, args.fanout,
+                        cap_div=args.cap_div)
                for d in args.dists.split(",")]
 
     print("  SUMMARY (the same procedure, different verdicts):")
@@ -338,10 +366,24 @@ def main():
         print(f"    {r['dist']:34s} base {r['base']:5.2f} ({r['winner']:14s}) corridor "
               f"{r['corridor']:5.2f}, captured {100*r['frac']:6.1f}%  -> {tag}"
               f"   [vs binary alone: {100*r['naive_frac']:5.1f}%]")
-    print("  Contrast with caching: there the oracle needs the FUTURE (unreachable) and no "
-          "deployable\n  policy captures the corridor; here the oracle needs only the KEYS "
-          "(reachable) and the\n  learned index captures it. The reachability restriction is what "
-          "separates the two verdicts.")
+    # The closing read is DERIVED, never asserted. An earlier version of this script printed
+    # "the learned index captures it" unconditionally -- a conclusion hardcoded independently of the
+    # measurement, which is precisely the failure mode this paper is about. It now reports what the
+    # arms actually returned.
+    nb = sum(1 for r in out if r["live"])
+    print(f"  BUILD verdicts: {nb} of {len(out)} (probes unit).")
+    if nb == len(out) and out:
+        print("  Reachability reading HOLDS: the caching oracle needs the FUTURE (unreachable) and no\n"
+              "  deployable policy captures that corridor; here the oracle needs only the KEYS\n"
+              "  (reachable) and the tuned learned index does capture it.")
+    elif nb == 0:
+        print("  Reachability reading NOT SUPPORTED on these inputs: even with a reachable oracle, the\n"
+              "  tuned learned index does not beat the tuned non-learned family. Reachability is then\n"
+              "  necessary but NOT sufficient -- a strong non-learned method can already sit on the\n"
+              "  reachable ceiling, which is the same bar-saturation mechanism the caching half reports.")
+    else:
+        print("  MIXED: reachability permits capture on some key distributions and not others; report\n"
+              "  per-distribution, and do not state a single cross-domain verdict.")
     print(LINE)
 
 
