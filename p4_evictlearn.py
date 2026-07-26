@@ -487,9 +487,22 @@ def run(trace, cap, pos, szs, args):
         verdict = (f"NO CORRIDOR -- corridor below the {args.bar:.1f}-pt bar "
                    f"(CI lower {c_lo:+.2f}); nothing to build here.")
     print(f"  VERDICT: {verdict}")
-    print(f"  CONTRAST: on this trace the deployable PREFETCH policy lands well BELOW the baseline "
-          f"(the endogenous-slack trap); this learned {args.mode} policy lands ABOVE it. Same "
-          f"instrument, opposite decision -- across capabilities, not just workloads.")
+    # CONTRAST is DERIVED, never asserted. An earlier version printed "this learned policy lands
+    # ABOVE it" unconditionally -- a conclusion independent of the measurement, which on cluster50
+    # (-0.01) and cluster53 (+0.00) was simply false. Same failure mode as the hardcoded closing
+    # claim removed from p4_index.py; a claim about the data must be computed from the data.
+    if cap_pt > 0.05:
+        print(f"  CONTRAST: the deployable PREFETCH policy lands well BELOW the baseline here (the "
+              f"endogenous-slack trap); this learned {args.mode} policy lands ABOVE it "
+              f"({cap_pt:+.2f} pts). Same instrument, opposite decision -- across capabilities.")
+    elif cap_pt >= -0.05:
+        print(f"  CONTRAST: this learned {args.mode} policy neither helps nor hurts ({cap_pt:+.2f} "
+              f"pts): it collapses onto the tuned baseline. The corridor is real and this "
+              f"capability does not reach it either.")
+    else:
+        print(f"  CONTRAST: this learned {args.mode} policy lands BELOW the tuned baseline "
+              f"({cap_pt:+.2f} pts) -- the same direction as the prefetch result, so the negative "
+              f"is not specific to prefetching on this trace.")
     print(LINE)
     return dict(base=base["ohr"], belady=ceil["ohr"], learned=learn["ohr"], mode=args.mode,
                 corridor=corridor_pt, corridor_ci=(c_lo, c_hi), captured=cap_pt,
