@@ -17,6 +17,13 @@ pg_isready -q || { echo "  server not accepting connections; run: bash install_p
 python -c "import psycopg2" 2>/dev/null || pip install -q psycopg2-binary
 
 echo "== 2/5 pg_hint_plan (the ceiling arms inject cardinalities through it) =="
+# Distinguish "cannot connect" from "extension absent": conflating them sent the last run chasing
+# a missing package when the real cause was a missing role.
+if ! psql -d postgres -tAc "SELECT 1" >/dev/null 2>&1; then
+  echo "  !! cannot connect as $(whoami). The role or database is missing, not the extension."
+  echo "     Re-run:  bash install_postgres.sh   (its step 4 creates the role and database)"
+  exit 1
+fi
 # Availability in the catalogue is NOT sufficient: an unloaded library ignores hints silently,
 # which would make both ceilings equal the baseline and produce a fake NO CORRIDOR verdict.
 # p4_job.py --setup proves efficacy with a live hint; this is only the coarse presence check.
