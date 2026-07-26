@@ -173,6 +173,44 @@ def true_base_cards(cur, q):
     return cards
 
 
+def enable_hints(cur):
+    """Activate pg_hint_plan AND verify that hints actually take effect.
+
+    This is the experiment's most dangerous silent failure. pg_hint_plan is activated by LOAD (or
+    shared_preload_libraries), not necessarily by CREATE EXTENSION, and an unloaded library does
+    not error: it simply ignores every hint comment. Both ceiling arms would then execute the
+    baseline plan, both corridors would read ~0, and the harness would report NO CORRIDOR -- a
+    false negative manufactured by a broken tool rather than measured from the data.
+
+    So availability is not assumed from a catalogue lookup. A deliberately absurd Rows() hint is
+    issued against a real relation and the optimizer's row estimate is read back: if the estimate
+    does not move, hints are inert and the run aborts.
+    """
+    for stmt in ("LOAD 'pg_hint_plan'", "CREATE EXTENSION IF NOT EXISTS pg_hint_plan"):
+        try:
+            cur.execute(stmt); cur.connection.commit()
+        except Exception:
+            cur.connection.rollback()
+    try:
+        cur.execute("SELECT tablename FROM pg_tables WHERE schemaname='public' LIMIT 1")
+        row = cur.fetchone()
+        if not row:
+            return False
+        t = row[0]
+        cur.execute(f"EXPLAIN (FORMAT JSON) SELECT * FROM {t}")
+        plain = float(cur.fetchone()[0][0]["Plan"]["Plan Rows"])
+        cur.execute(f"/*+ Rows({t} #4242) */\nEXPLAIN (FORMAT JSON) SELECT * FROM {t}")
+        hinted = float(cur.fetchone()[0][0]["Plan"]["Plan Rows"])
+        cur.connection.commit()
+    except Exception:
+        cur.connection.rollback()
+        return False
+    ok = abs(hinted - 4242.0) < 1.0 and abs(hinted - plain) > 0.5
+    print(f"  hint efficacy  {'CONFIRMED' if ok else 'INERT'} "
+          f"(estimate {plain:.0f} -> {hinted:.0f} under a 4242-row hint)")
+    return ok
+
+
 def hint_rows(cards):
     """A pg_hint_plan block correcting the optimizer's row estimates.
 
@@ -276,16 +314,9 @@ def run(args):
     print(f"  {len(queries)} queries | bar: corridor >= {BAR_CORRIDOR_PCT:.0f}% AND > config span "
           f"(pre-registered, SPEC_job_prereg.md)")
 
-    has_hint = bool(sql_one(cur, "SELECT count(*) FROM pg_available_extensions "
-                                 "WHERE name='pg_hint_plan'"))
-    if has_hint:
-        try:
-            cur.execute("CREATE EXTENSION IF NOT EXISTS pg_hint_plan"); conn.commit()
-        except Exception:
-            conn.rollback(); has_hint = False
-    if not has_hint:
-        sys.exit("  !! pg_hint_plan is unavailable; the ceiling arms cannot inject cardinalities.\n"
-                 "     Install it (the oracle arms are the experiment) and re-run.")
+    if not enable_hints(cur):
+        sys.exit("  !! pg_hint_plan is unavailable or inactive; the ceiling arms cannot inject\n"
+                 "     cardinalities. Run install_postgres.sh, then job_setup.sh, then re-run.")
 
     # ---- 1. the swept non-learned family; the tuned baseline is its best member (M1) ----
     print(f"\n  [1/4] configuration sweep ({len(STAT_TARGETS)*2} configurations)")
@@ -463,8 +494,10 @@ def setup(args):
     """Verify the target machine can run the experiment before a week of work is committed."""
     conn = connect(args.db); cur = conn.cursor()
     print(f"\n  server        {sql_one(cur, 'SHOW server_version')}")
-    ext = sql_one(cur, "SELECT count(*) FROM pg_available_extensions WHERE name='pg_hint_plan'")
-    print(f"  pg_hint_plan  {'available' if ext else 'MISSING -- required for the ceiling arms'}")
+    ok = enable_hints(cur)
+    if not ok:
+        print("  pg_hint_plan  MISSING or INERT -- the ceiling arms cannot run. Fix before the run:\n"
+              "                apt-get install postgresql-16-pg-hint-plan, then restart the server.")
     n = sql_one(cur, "SELECT count(*) FROM information_schema.tables "
                      "WHERE table_schema='public'")
     print(f"  tables        {n}")

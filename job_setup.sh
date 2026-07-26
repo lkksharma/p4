@@ -8,20 +8,21 @@ WORK=${WORK:-$PWD/jobdata}
 JOB=${JOB:-$PWD/job}
 
 echo "== 1/5 preconditions =="
-command -v psql >/dev/null || { echo "psql not found; install PostgreSQL >= 16"; exit 1; }
+if ! command -v psql >/dev/null; then
+  echo "  psql not found. Run first:  bash install_postgres.sh"
+  exit 1
+fi
 psql -V
+pg_isready -q || { echo "  server not accepting connections; run: bash install_postgres.sh"; exit 1; }
 python -c "import psycopg2" 2>/dev/null || pip install -q psycopg2-binary
 
-echo "== 2/5 pg_hint_plan (required: the ceiling arms inject cardinalities through it) =="
+echo "== 2/5 pg_hint_plan (the ceiling arms inject cardinalities through it) =="
+# Availability in the catalogue is NOT sufficient: an unloaded library ignores hints silently,
+# which would make both ceilings equal the baseline and produce a fake NO CORRIDOR verdict.
+# p4_job.py --setup proves efficacy with a live hint; this is only the coarse presence check.
 if ! psql -d postgres -tAc \
     "SELECT 1 FROM pg_available_extensions WHERE name='pg_hint_plan'" | grep -q 1; then
-  cat <<'EOF'
-  !! pg_hint_plan is NOT available. The oracle arms cannot run without it.
-     Debian/Ubuntu:  apt-get install postgresql-16-pg-hint-plan
-     from source:    git clone https://github.com/ossc-db/pg_hint_plan
-                     cd pg_hint_plan && make && make install
-     Then re-run this script.
-EOF
+  echo "  !! pg_hint_plan not installed. Run:  bash install_postgres.sh"
   exit 1
 fi
 
