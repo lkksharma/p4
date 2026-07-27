@@ -33,11 +33,39 @@ if ! psql -d postgres -tAc \
   exit 1
 fi
 
-echo "== 3/5 IMDB snapshot =="
+echo "== 3a/5 JOB queries + schema =="
+# The 113 queries, schema.sql and fkindexes.sql live in the benchmark repository, not in the
+# data tarball.
+if [ ! -f "$JOB/schema.sql" ]; then
+  if command -v git >/dev/null; then
+    rm -rf "$JOB"
+    git clone --depth 1 https://github.com/gregrahn/join-order-benchmark.git "$JOB"
+  else
+    mkdir -p "$JOB" && cd "$JOB"
+    curl -fL -o job.tar.gz \
+      https://github.com/gregrahn/join-order-benchmark/archive/refs/heads/master.tar.gz
+    tar xzf job.tar.gz --strip-components=1 && rm job.tar.gz
+    cd - >/dev/null
+  fi
+fi
+echo "  $(ls "$JOB"/*.sql 2>/dev/null | grep -cvE 'schema|fkindexes') queries, schema present"
+
+echo "== 3b/5 IMDB snapshot =="
 mkdir -p "$WORK" && cd "$WORK"
-if [ ! -f imdb.tgz ] && ! psql -d "$DB" -tAc "SELECT to_regclass('title')" 2>/dev/null | grep -q title; then
-  echo "  downloading the JOB IMDB snapshot (~1.2 GB compressed)"
-  curl -fL -o imdb.tgz http://homepages.cwi.nl/~boncz/job/imdb.tgz
+if ! psql -d "$DB" -tAc "SELECT to_regclass('title')" 2>/dev/null | grep -q title; then
+  if [ ! -f imdb.tgz ]; then
+    # The original CWI path 404s; try the maintained mirrors in turn and keep the first that works.
+    ok=0
+    for U in "https://event.cwi.nl/da/job/imdb.tgz" \
+             "https://bonsai.cedardb.com/job/imdb.tgz" \
+             "https://homepages.cwi.nl/~boncz/job/imdb.tgz"; do
+      echo "  trying $U"
+      if curl -fL --retry 2 -o imdb.tgz "$U"; then ok=1; break; fi
+      rm -f imdb.tgz
+    done
+    [ "$ok" = 1 ] || { echo "  !! every mirror failed; download imdb.tgz manually into $WORK"; exit 1; }
+  fi
+  echo "  extracting (~3.7 GB)"
   tar xzf imdb.tgz
 fi
 
@@ -46,10 +74,15 @@ if ! psql -d "$DB" -tAc "SELECT to_regclass('title')" 2>/dev/null | grep -q titl
   createdb "$DB" 2>/dev/null || true
   # schema + FK indexes ship with the JOB artifact
   psql -d "$DB" -f "$JOB/schema.sql"
-  for f in *.csv; do
-    t="${f%.csv}"
+  # The tarball has shipped the CSVs both at the top level and inside a directory across
+  # revisions, so locate them rather than assuming a layout.
+  CSVDIR=$(dirname "$(find "$WORK" -maxdepth 2 -name 'title.csv' | head -1)")
+  [ -n "$CSVDIR" ] && [ -d "$CSVDIR" ] || { echo "  !! no title.csv found under $WORK"; exit 1; }
+  echo "  loading from $CSVDIR"
+  for f in "$CSVDIR"/*.csv; do
+    t=$(basename "$f" .csv)
     echo "  COPY $t"
-    psql -d "$DB" -c "\\copy $t FROM '$WORK/$f' CSV ESCAPE '\\'"
+    psql -d "$DB" -c "\\copy $t FROM '$f' CSV ESCAPE '\\'"
   done
   psql -d "$DB" -f "$JOB/fkindexes.sql"
 else

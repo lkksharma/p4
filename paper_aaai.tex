@@ -130,6 +130,24 @@ trace & gross & cold & \% phantom & \textbf{learnable} (95\% CI) \\
 \end{table}
 
 
+\textbf{The verdicts do not depend on the exact bar.} Pre-registration is a process claim a reader cannot audit, so it is supplemented with a robustness result that can be: sweeping the threshold from 4 to 12 points, applied as the rule applies it, to the bootstrap lower bound.
+
+\vspace{2pt}\noindent{\small
+\begin{tabular}{lcccccc}
+\toprule
+trace & CI lo & 4 & 6 & \textbf{8} & 10 & 12 \\
+\midrule
+\texttt{cluster53} & 19.4 & live & live & \textbf{live} & live & live \\
+\texttt{cluster50} & 15.8 & live & live & \textbf{live} & live & live \\
+\texttt{wiki\_2019t} & 10.9 & live & live & \textbf{live} & live & dead \\
+\texttt{msr\_hm\_0} & 4.89$^{*}$ & live & dead & \textbf{dead} & dead & dead \\
+\texttt{meta\_rprn} & 4.32$^{*}$ & live & dead & \textbf{dead} & dead & dead \\
+\texttt{meta\_reag} & 3.63$^{*}$ & dead & dead & \textbf{dead} & dead & dead \\
+\bottomrule
+\end{tabular}}\vspace{2pt}
+
+\noindent($^{*}$point estimates, conservative here since a bootstrap bound could only be smaller.) Every survivor clears 10 and every removal fails at 6. The other thresholds have wider margins still: \rung{r2}'s arbitration gap measured $\pm0.01$ against a 2-point requirement and so survives any bar above $0.1$, while in the index domain \texttt{meta\_rprn} would flip at 51\%, which is why it is reported as marginal. Whether the thresholds were fixed in advance therefore decides no verdict except that one.
+
 \textbf{Four inflation mechanisms, caught on the record.} The deflation decomposes into four mechanisms (Table~\ref{tab:inflation}), each caught by a named component and each first exposed on this work's own results rather than on the literature's. Stage~2 adds five further self-caught errors, two inside the oracle arms themselves, and the sharpest instance, which both removed and restored verdicts under one rule, is reported with the learned-index results below. A protocol's credibility rests on what it catches, including from its own authors; a test that never overturns anything provides no evidence.
 
 \begin{table}[t]

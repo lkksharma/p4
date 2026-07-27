@@ -205,3 +205,48 @@ complete under a configuration is a result about that configuration, not missing
 *Are We Ready For Learned Cardinality Estimation?*, Best EA&B Paper), `leis2025still` (VLDB 2025,
 *Still Asking: How Good Are Query Optimizers, Really?*). Author lists and venues to be verified
 against the published records before camera-ready, per the project's standing citation rule.
+
+---
+
+## 10. Amendment, 2026-07-26: the reachability split, changed before any measurement
+
+**What changed.** Section 3 pre-registered the reachability split as **base-table versus join**:
+inject true cardinalities for single-table selections (reachable), against true cardinalities
+everywhere (gross). It is now **pairwise versus n-way**: inject true cardinalities for 2-way joins
+(reachable), against joins up to 4 relations (gross).
+
+**Why, and when.** `pg_hint_plan`'s `Rows()` hint corrects "row number of a result of the joins on
+the tables specified" and is silently ignored on a single relation. The base-table arm is therefore
+not expressible with this instrument at all. This was discovered by the hint-efficacy invariant
+(§11) failing on the target machine **before a single latency measurement was taken**, and no
+corridor number existed at the time of the change. The amendment is forced by tooling, not chosen
+after seeing a result.
+
+**Why the substitute tests the same question.** The original split asked whether a *bounded*
+statistical summary can reach the corridor, or whether it needs correlation structure no such
+summary holds. Pairwise versus n-way asks exactly that, and arguably asks it more directly:
+\citet{leis2015good} identify multiplicative error compounding along join paths as the mechanism,
+and pairwise-versus-higher-order is precisely where that compounding begins. Base-table estimates
+are, in that same work, reported as comparatively accurate, so the base/join cut was the weaker of
+the two candidate boundaries in any case. Both arms now share identical base-table estimates, which
+makes the base-table contribution a controlled constant rather than a confound.
+
+**What is unchanged.** The bar (§5), the fork (§6), the retrospective constraints (§7) and the
+iso-resource discipline (§4) are untouched. The corridor is still reachable-ceiling versus tuned
+baseline on total time, and 20% plus the configuration-span condition still decide it.
+
+## 11. The hint-efficacy invariant, and why it exists
+
+`pg_hint_plan` does not error when it is inactive: it ignores hint comments. An unloaded library
+would leave both ceiling arms executing the baseline plan, both corridors would read approximately
+zero, and the harness would print **NO CORRIDOR** with every appearance of a measurement. That is
+the outcome most favourable to this section's retrospective claim, which makes it exactly the
+failure that would never have been questioned.
+
+`enable_hints()` therefore proves efficacy before anything is measured: it issues a deliberately
+absurd `Rows(x y #4242)` hint against a self-join and reads the optimizer's estimate back. If the
+estimate does not move to 4242, the run **aborts**. The probe must be a join, for the same reason
+the base-table arm had to be abandoned.
+
+On first execution against the loaded IMDB database this invariant reported `INERT` and stopped the
+run, which is how the `Rows()` limitation was found. It has already paid for itself.
