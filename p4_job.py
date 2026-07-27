@@ -412,18 +412,22 @@ def run(args):
     t0 = time.time()
     reach_ms, reach_to, reach_trunc = [], 0, 0
     for q in queries:
-        cards, trunc = true_join_cards(cur, q, REACH_MAX_SIZE, CARD_BUDGET_S)
+        cards, trunc = true_join_cards(cur, q, REACH_MAX_SIZE, args.card_budget)
         ms, to = measure(cur, q["sql"], hint_rows(cards))
         reach_ms.append(ms); reach_to += to; reach_trunc += trunc
     print(f"     computed in {time.time()-t0:.0f}s | total={sum(reach_ms)/1000:8.1f}s "
-          f"timeouts={reach_to} | {reach_trunc} queries hit the cardinality time budget")
+          f"timeouts={reach_to} | {reach_trunc} queries TRUNCATED")
+    if reach_trunc:
+        print(f"     !! {reach_trunc} queries only PARTIALLY corrected. Partial correction is a "
+              f"different treatment: at a 120s budget it inverted this benchmark's sign "
+              f"(-31.1% -> +23.7% once complete). Raise --card-budget until this reads 0.")
 
     # ---- 3. HIGHER-ORDER join cardinalities: the GROSS ceiling (diagnostic) ----
     print(f"\n  [3/4] join subqueries up to {GROSS_MAX_SIZE} relations "
           f"(gross ceiling; DIAGNOSTIC)")
     gross_ms, gross_to, gross_trunc = [], 0, 0
     for q in queries:
-        cards, trunc = true_join_cards(cur, q, GROSS_MAX_SIZE, CARD_BUDGET_S * 3)
+        cards, trunc = true_join_cards(cur, q, GROSS_MAX_SIZE, args.card_budget * 3)
         ms, to = measure(cur, q["sql"], hint_rows(cards))
         gross_ms.append(ms); gross_to += to; gross_trunc += trunc
     print(f"     total={sum(gross_ms)/1000:8.1f}s timeouts={gross_to} | "
