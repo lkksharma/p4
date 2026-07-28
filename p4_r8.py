@@ -218,6 +218,106 @@ def survival_at(log, delta=100):
     return float(alive.mean())
 
 
+def km_survival(log, t):
+    """Kaplan-Meier P(a prefetched object has NOT been evicted by age t).
+
+    Uses are CENSORING events, not survivals. When a prefetched object is requested, PFCache stops
+    tracking it (it leaves pf_pending but stays resident), so its lifetime is observed only up to
+    that point: an object used at age 5 tells us nothing about whether it would still have been
+    resident at age 100. Counting it as a survivor, which the first implementation did, biases the
+    estimate upward by exactly the precision of the arm.
+    """
+    ev = sorted(log)
+    n = at_risk = len(ev)
+    if n == 0:
+        return float("nan")
+    S = 1.0
+    for delta, used in ev:
+        if delta > t:
+            break
+        if at_risk <= 0:
+            break
+        if used == 0:                       # evicted before use: a failure
+            S *= (1.0 - 1.0 / at_risk)
+        at_risk -= 1                        # used or evicted, it leaves the risk set
+    return S
+
+
+def survival_report(label, log, t=100):
+    """Three estimators of S(t), because they bracket the answer and disagree diagnostically."""
+    if not log:
+        print(f"  {label:<26} no survival records")
+        return None
+    a = np.array(log, dtype=np.float64)
+    d, u = a[:, 0], a[:, 1]
+    naive = float(((d >= t) | (u > 0)).mean())      # what the first implementation computed
+    km = km_survival(log, t)                        # correct: uses censored
+    evict_only = float((d[u == 0] >= t).mean()) if (u == 0).any() else float("nan")
+    print(f"  {label:<26} KM {km:6.3f} | naive {naive:6.3f} | evicted-only {evict_only:6.3f} | "
+          f"n {len(log):>9,} used {u.mean():5.1%} | median age {np.median(d):8.0f}")
+    return km
+
+
+def survcheck(trace, cap, pos, szs, haz, args):
+    """Does the paper's endogenous-slack measurement reproduce?
+
+    The mechanism section rests on one number: S(100) falling from 1.00 under the tuned bar to
+    0.055 under a wide causal policy, which is what licenses "the policy's own volume destroys the
+    window its timing model must hit". The r8 sweep measured S(100)=1.000 at every setting, up to
+    1.79M fetches, which contradicts it. Either the estimator is wrong, the original came from a
+    different configuration, or the claim does not hold. This measures both arms under all three
+    estimators so the disagreement is attributable.
+    """
+    tf = args.train_frac
+    n = trace["n"]
+
+    def mk():
+        return PREDS[args.pred](trace, train_frac=tf, window=args.window, k=args.k, tau=args.tau)
+
+    def mk_wide(fan):
+        p = PREDS[args.pred](trace, train_frac=tf, window=args.window, k=args.k, tau=args.tau,
+                             top_m=max(16, fan))
+        p.k, p.tau = fan, 0.0
+        return p
+
+    print(f"\n{LINE}\n  SURVIVAL CHECK -- does S(100) collapse under a wide causal policy?\n{LINE}")
+    bar = PFCache(cap, "s3fifo", mk(), positions=pos, sizes=szs).run(
+        trace, cold_train_frac=tf, record_survival=True)
+    print(f"  cache holds ~{cap // max(1, int(np.median(list(szs.values())))):,} median-sized "
+          f"objects; bar issues {bar['pf_issued']:,} prefetches over {n:,} requests")
+    s_bar = survival_report("BAR (tuned)", bar["pf_survival"])
+
+    rows = []
+    for fan in (args.fanout, 8):
+        for g in (0.5, 0.1):
+            sch = VolPolicy(mk_wide(fan), pos, szs, haz, bar["prefetch_bytes"] / max(n, 1),
+                            bar["prefetch_bytes"], gamma=g, floor=0.0, sel_q=0.0)
+            r = PFCache(cap, "s3fifo", sch, positions=pos, sizes=szs, pf_byte_rate=None).run(
+                trace, cold_train_frac=tf, record_survival=True)
+            km = survival_report(f"wide causal k={fan} g={g}", r["pf_survival"])
+            rows.append((f"k={fan} g={g}", km, r["pf_issued"], r["pf_precision"]))
+
+    print(f"  {'-'*100}")
+    kms = [k for _, k, _, _ in rows if k is not None and np.isfinite(k)]
+    if s_bar is not None and kms:
+        lo = min(kms)
+        print(f"  BAR S(100) = {s_bar:.3f}   worst wide-causal S(100) = {lo:.3f}   "
+              f"ratio {lo/max(s_bar,1e-9):.2f}x")
+        if lo < 0.30 * s_bar:
+            print("  VERDICT  COLLAPSE REPRODUCES -- the window does shrink materially under a "
+                  "wide causal policy, so endogenous slack is supported; the r8 sweep's "
+                  "S(100)=1.000 was the naive estimator counting used objects as survivors.")
+        else:
+            print("  VERDICT  COLLAPSE DOES NOT REPRODUCE -- S(100) stays high under every wide "
+                  "causal configuration measured here, so the mechanism section's 1.00 -> 0.055 "
+                  "cannot be supported by this harness. The trap verdict is unaffected (every arm "
+                  "still fails), but the EXPLANATION must be restated: these policies score at the "
+                  "no-prefetch baseline because precision collapses and the byte budget is spent "
+                  "on candidates never requested, not because the residence window closed. "
+                  "Locate the original 0.055 before submitting.")
+    print(LINE + "\n")
+
+
 def run(trace, cap, pos, szs, haz, args):
     tf = args.train_frac
     n = trace["n"]
@@ -344,6 +444,9 @@ def main():
     ap.add_argument("--train-frac", type=float, default=0.5)
     ap.add_argument("--fanout", type=int, default=32, help="wide emission fan-out (r4's setting)")
     ap.add_argument("--sweep", choices=("model", "volume"), default="volume")
+    ap.add_argument("--survcheck", action="store_true",
+                    help="re-measure S(100) under three estimators on the bar and wide causal arms; "
+                         "checks whether the endogenous-slack collapse reproduces")
     ap.add_argument("--win", type=int, default=20000, help="sliding window for realised precision")
     ap.add_argument("--kp", type=float, default=0.05, help="controller proportional gain")
     ap.add_argument("--blocks", type=int, default=1000)
@@ -353,7 +456,9 @@ def main():
     if not (args.trace and args.pred and args.tau is not None and args.k is not None and args.haz):
         ap.error("need --trace --pred --tau --k --haz")
     trace, cap, pos, szs = prep(args.trace, args.limit, args.cache_frac)
-    run(trace, cap, pos, szs, np.load(args.haz), args)
+    haz = np.load(args.haz)
+    survcheck(trace, cap, pos, szs, haz, args) if args.survcheck else \
+        run(trace, cap, pos, szs, haz, args)
 
 
 if __name__ == "__main__":
