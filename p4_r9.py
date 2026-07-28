@@ -188,13 +188,26 @@ def run(trace, cap, pos, szs, args):
             pstar = a[1]
         print(f"  BREAK-EVEN PRECISION  p* = {pstar:.3f}   "
               f"(bracketed by {b[1]:.3f} at {b[3]:+.2f} and {a[1]:.3f} at {a[3]:+.2f})")
-        for name, got in (("r6 causal placement", 0.05), ("r8 best swept", 0.039)):
-            if got > 0:
-                print(f"     {name:<22} achieves {got:.3f}  ->  short by {pstar / got:.1f}x")
+        # These reference precisions were once literals in this file. That is the same defect
+        # already removed from p4_index.py and p4_evictlearn.py: a printed comparison that does
+        # not move when the measurement moves. They were also trace-independent, so the r6 figure
+        # for Wikipedia was being reported unchanged on cluster50. Supply them per trace with
+        # --ref, taking each value from that trace's own arm log.
+        best = None
+        for spec in (args.ref or []):
+            name, _, val = spec.partition("=")
+            got = float(val)
+            if got <= 0:
+                continue
+            print(f"     {name:<22} achieves {got:.3f}  ->  short by {pstar / got:.1f}x")
+            best = got if best is None else max(best, got)
         print(f"  READS AS: a causal scheduler must convert {100*pstar:.0f}% of the bytes it spends "
-              f"into hits\n            to match the tuned baseline at this coverage; the best causal "
-              f"model measured\n            converts 5%. The corridor is real and the specification "
-              f"to reach it is now quantified.")
+              f"into hits\n            to match the tuned baseline at this coverage.", end="")
+        if best is not None:
+            print(f" The best causal arm supplied\n            converts {100*best:.0f}%.", end="")
+        else:
+            print("\n            No --ref arms supplied, so no shortfall is claimed here.", end="")
+        print(" The corridor is real and the\n            specification to reach it is now quantified.")
     elif not neg_rows:
         print("  every arm beats the bar -- p* lies below the lowest precision swept; widen --fracs")
     else:
@@ -221,6 +234,10 @@ def main():
     ap.add_argument("--fracs", type=float, nargs="+",
                     default=[0.0, 0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1.0],
                     help="fractions of false positives admitted; 0 = precision 1.0 (r4)")
+    ap.add_argument("--ref", nargs="*", metavar="NAME=PRECISION",
+                    help="measured precisions of real causal arms on THIS trace, e.g. "
+                         "--ref 'r6 causal placement=0.062' 'r8 best swept=0.039'. Read each "
+                         "value from that trace's own log; nothing here supplies a default.")
     ap.add_argument("--blocks", type=int, default=1000)
     ap.add_argument("--resamples", type=int, default=10000)
     ap.add_argument("--seed", type=int, default=0)

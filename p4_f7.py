@@ -406,12 +406,12 @@ def main():
     ap.add_argument("--max-pool", type=int, default=4096,
                     help="cap on pending candidates in the CAUSAL arms only (model/point) -- the "
                          "oracle arm always runs unbounded: it is the construction check and must "
-                         "be exact (a capped oracle froze spend at 0.52x and read -60% of F5). "
+                         "be exact (a capped oracle froze spend at 0.52x and read -60%% of F5). "
                          "Keyed by SOONEST WAKE (the funding frontier), never by size. Sweep it "
                          "(e.g. 4096 vs 16384) and quote a verdict only where capture and "
                          "on-time/LATE are cap-stable.")
     ap.add_argument("--verbose", action="store_true",
-                    help="clean newline progress every 200k reqs (% done, LATE rate, req/s, ETA). "
+                    help="clean newline progress every 200k reqs (%% done, LATE rate, req/s, ETA). "
                          "Flush-safe and flicker-free -- use this for parallel runs.")
     ap.add_argument("--tqdm", action="store_true",
                     help="live tqdm bar per replay. Avoid with parallel runs (bars flicker).")

@@ -1,0 +1,204 @@
+\documentclass[letterpaper]{article} % DO NOT CHANGE THIS
+\usepackage[submission]{aaai2027}  % DO NOT CHANGE THIS
+\usepackage[hyphens]{url}  % DO NOT CHANGE THIS
+\usepackage{graphicx} % DO NOT CHANGE THIS
+\urlstyle{rm} % DO NOT CHANGE THIS
+\def\UrlFont{\rm}  % DO NOT CHANGE THIS
+\usepackage{natbib}  % DO NOT CHANGE THIS
+\usepackage{caption} % DO NOT CHANGE THIS
+\captionsetup{font=small,skip=4pt}
+\frenchspacing  % DO NOT CHANGE THIS
+\usepackage{booktabs}
+\usepackage{amsmath,amssymb}
+\pdfinfo{
+/TemplateVersion (2027.1)
+}
+\setcounter{secnumdepth}{0}
+
+\title{Supplementary Document\\ Opportunity Certification: Deciding Whether a Learned Component Is Warranted, Before Training One}
+\author{Anonymous Submission}
+\affiliations{}
+
+\newcommand{\rung}[1]{\textsc{#1}}
+
+\begin{document}
+\maketitle
+
+\noindent Supporting data for the main text. Cache traces are 2M-request prefixes at a 1\% cache;
+\texttt{wiki\_2019t} baseline OHR is $0.1522$ without prefetching and $0.5531$ at the tuned bar
+(982{,}954 fetches, precision $0.874$).
+
+\section{A. Break-even precision (main text, \rung{r6} mechanism)}
+
+\noindent Coverage held at \rung{r4}'s fan-out 32; every genuinely reused candidate gets \rung{r4}'s
+just-in-time insertion; only precision is degraded, by admitting a fraction $f$ of never-requested
+candidates at emission. Prefetch traffic metered to the bar's byte rate.
+
+\begin{table}[htbp]
+\centering\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{rrrrrr}
+\toprule
+$f$ & prec. & OHR & corridor & 95\% CI & traf. \\
+\midrule
+0.000 & 1.000 & 0.6379 & $+8.48$ & $[+6.9,+10.0]$ & $1.01\times$ \\
+0.001 & 0.993 & 0.6378 & $+8.47$ & $[+6.9,+10.0]$ & $1.01\times$ \\
+0.003 & 0.980 & 0.6378 & $+8.47$ & $[+6.9,+10.0]$ & $1.02\times$ \\
+0.010 & 0.935 & 0.6343 & $+8.12$ & $[+6.6,+9.7]$ & $1.05\times$ \\
+0.030 & 0.827 & 0.6139 & $+6.08$ & $[+4.7,+7.5]$ & $1.11\times$ \\
+0.100 & 0.629 & 0.5656 & $+1.24$ & $[+0.1,+2.4]$ & $1.20\times$ \\
+0.300 & 0.469 & 0.5228 & $-3.04$ & $[-3.9,-2.1]$ & $1.26\times$ \\
+1.000 & 0.370 & 0.5020 & $-5.12$ & $[-5.9,-4.3]$ & $1.28\times$ \\
+\bottomrule
+\end{tabular}
+\caption{Zero crossing interpolates to $p^{\star}=0.582$; \rung{r6} achieves $0.062$. Two
+conservatisms favour the causal policy: the $f{=}0$ ceiling ($+8.48$) sits below \rung{r4}'s
+$+10.41$, and the rows bracketing $p^{\star}$ are allowed more traffic ($1.20$--$1.26\times$) than
+the bar ($1.09\times$). $p^{\star}$ is therefore a lower bound.}
+\label{tab:s-prec}
+\end{table}
+
+\section{B. Fan-out sweep}
+
+\noindent In Table~\ref{tab:s-fanout} both endpoints fail for opposite reasons, which is the signature of a frontier rather than
+of a badly chosen operating point.
+
+\begin{table}[htbp]
+\centering\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{rrrrr}
+\toprule
+fan-out & \rung{r4} ceiling & coverage & \rung{r6} corridor & precision \\
+\midrule
+1  & $-7.01$ & --- & --- & 0.874 \\
+2  & $-2.66$ & 58.8\% & $-40.82$ & 0.075 \\
+4  & $+1.19$ & 63.3\% & $-40.53$ & 0.068 \\
+8  & $+4.92$ & 67.9\% & $-40.35$ & 0.064 \\
+32 & $+10.41$ & 74.1\% & $-40.06$ & 0.062 \\
+\bottomrule
+\end{tabular}
+\caption{\texttt{wiki\_2019t}, \rung{r6} causal hazard model at $\gamma{=}0.1$. The ceiling climbs
+with coverage while the causal arm stays flat near $-40$. Fan-out 1 is \rung{r3}: perfect timing on
+the bar's own stream, precision high, coverage too narrow to pay.}
+\label{tab:s-fanout}
+\end{table}
+
+\section{C. Prefetch survival}
+
+\noindent Table~\ref{tab:s-surv} estimates Kaplan-Meier on prefetch lifetimes: an object \emph{used} is right-censored at its use, an
+object \emph{evicted unused} is a death. The naive estimator counts use as survival, which biases
+with precision and cannot be compared across arms.
+
+\begin{table}[htbp]
+\centering\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{llrrrrr}
+\toprule
+trace & arm & KM & naive & used & prec. & vol. \\
+\midrule
+\texttt{wiki\_2019t} & bar & 1.000 & 0.127 & 87.4\% & 0.874 & $1.00\times$ \\
+\texttt{wiki\_2019t} & \rung{r6} & 0.984 & 0.974 & 6.2\% & 0.062 & $1.03\times$ \\
+\texttt{cluster50} & bar & 1.000 & 0.138 & 86.4\% & 0.863 & $1.00\times$ \\
+\texttt{cluster50} & \rung{r6} & 0.982 & 0.957 & 5.4\% & 0.054 & $2.18\times$ \\
+\bottomrule
+\end{tabular}
+\caption{$S(100)$ on the scored arm. The residence window does not close, so the deficit is budget
+spent on objects never requested rather than objects displaced before use; the implied demand-side
+hit rate moves by under $0.4$ points.}
+\label{tab:s-surv}
+\end{table}
+
+\paragraph{A withdrawn claim.} An earlier draft attributed the \rung{r6} failure to \emph{endogenous
+slack}, the policy's own volume evicting its future targets, citing $S(100)$ falling from $1.00$ to
+$0.055$ (\texttt{wiki\_2019t}) and $0.135$ (\texttt{cluster50}). Those figures are correctly
+computed but were measured on an \emph{unmetered} replay at zero threshold and fan-out 32, admitting
+13{,}567{,}877 objects over 2M requests, $13.8\times$ the bar's 982{,}954, and so describe no arm
+the Ladder scores. The table above repeats the measurement on the scored, byte-metered arm.
+Independently, Stage~1's iso-bandwidth discipline is what prevents volume from being the operative
+mechanism, so a volume-driven account is inconsistent with the design that produced the number.
+
+\clearpage
+\section{D. Inflation mechanisms}
+
+\begin{table}[htbp]
+\centering\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{p{1.7cm}p{3.0cm}p{3.05cm}}
+\toprule
+mechanism & exhibited by & caught by \\
+\midrule
+M1 under-tuned baseline & synthetic $+42\to-0.02$; \texttt{cluster26} $+12.5\to$ below bar & family sweep over Markov-1/2/3 and LSTM, $\times\,\tau\times k$ \\
+M2 bandwidth mismatch & synthetic oracle at $1.27\times$ baseline traffic & token bucket at the baseline's byte rate \\
+M3 traffic-bought corridor & \texttt{cluster26}: ceiling $1.16\times$ vs bar $1.09\times$ & Pareto-dominance check \\
+M4 cold conflation & \texttt{meta\_rprn} $+32.6$ gross $\to +4.3$ learnable & warm (in-vocabulary) ceiling restriction \\
+\bottomrule
+\end{tabular}
+\label{tab:s-infl}
+\end{table}
+
+\section{E. Learned-index error distributions}
+
+\noindent Key-set provenance: \texttt{books}, \texttt{osm\_cellids} and \texttt{fb} are SOSD key
+sets; \texttt{meta\_rprn} and \texttt{wiki\_2019t} are the trace identifier sets. Against binary
+search alone, the field's customary comparison, the real-key rows of the main text's Table~4 read
+$91.9$, $90.9$, $69.7$, $40.0$ and $22.7$\%, so the baseline correction is worth up to 290 points of
+apparent capture (\texttt{wiki\_2019t}, $22.7\to-267.3$). Under a byte-matched leaf cap ($N/35$
+rather than $N/16$) \texttt{books} reads $56.8$\% and \texttt{meta\_rprn} $27.9$\%, so only
+\texttt{books} is claimed as a build.
+
+\noindent In Table~\ref{tab:s-index}, per-leaf \emph{maximum} error sets the search window, and how it responds to capacity
+predicts every verdict independently of the outcome.
+
+\begin{table}[htbp]
+\centering\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lrrp{3.4cm}}
+\toprule
+key set & $\le$1 ln & $>$64 ln & response to capacity \\
+\midrule
+\texttt{meta\_rprn} & 97.5\% & --- & captured \\
+\texttt{books} & 93.6\% & 6.4\% & captured (bimodal) \\
+\texttt{osm\_cellids} & --- & 94\%$\to$16\% & $13.13\to7.05$ probes; B-tree $6.00$ \\
+\texttt{fb} & 0\% & 100\% & inert across $125\times$ leaves \\
+\texttt{wiki\_2019t} & 0\% & 100\% & inert across $125\times$ leaves \\
+\bottomrule
+\end{tabular}
+\caption{Captured, approached-and-missed, and structurally unfit. The last two rows are a failure of
+piecewise-linear approximation that no capacity budget addresses. The two cost units disagree in
+both directions across the suite (on \texttt{books} probes flatter the model, on synthetic uniform
+keys cache lines do), so a single-metric evaluation would have returned a wrong verdict twice. The
+correctness invariant, every key inside its declared window, holds on every run.}
+\label{tab:s-index}
+\end{table}
+
+\section{F. The Instrument: four arms at one byte budget}
+
+\noindent Table~\ref{tab:s-arms} specifies the four arms, removed from the main text for length.
+
+\begin{table}[htbp]
+\centering\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{p{1.7cm}p{3.2cm}p{2.85cm}}
+\toprule
+arm & definition & role \\
+\midrule
+BASE & S3-FIFO, no prefetch & traffic denominator \\
+TUNED BASELINE & best OHR over $\{$Markov-1/2/3, LSTM$\}\times\tau\times k$, capped at $1.15\times$ BASE traffic & the bar \\
+GROSS CEILING & clairvoyant, all objects, token-bucketed to the bar's byte rate & diagnostic; over-counts compulsory misses \\
+WARM CEILING & same, restricted to training-vocabulary objects & primary ceiling \\
+\bottomrule
+\end{tabular}
+\caption{Learnable corridor $=$ WARM $-$ TUNED. Whatever the gross oracle wastes on unreachable
+objects, the warm ceiling re-spends on reachable ones. A trace is live only if the corridor clears
+8 points and the warm ceiling Pareto-dominates.}
+\label{tab:s-arms}
+\end{table}
+
+\section{G. On the number of positives}
+
+\noindent Across four settings and eight key sets the procedure returns one unambiguous \emph{build}
+and one marginal. The property under test is not the rate of positives but whether the verdict
+tracks a measured property of the input: capture is predicted by Section~E, measured independently
+of the verdict. A bar tuned to produce positives would not exhibit that correspondence.
+
+\end{document}

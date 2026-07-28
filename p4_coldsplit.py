@@ -27,6 +27,10 @@ from p4_strongbar import Markov3
 from p4_sweep import KS, prep
 
 PREDS = {"markov1": Markov1, "markov2": Markov2, "markov3": Markov3}
+# Online-updating variants (SPEC_online_prereg.md). Additive only: the frozen entries above are
+# the pre-registered arms and are left exactly as they were.
+from p4_online import ONLINE_PREDS as _ONLINE
+PREDS.update(_ONLINE)
 
 
 def main():
