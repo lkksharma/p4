@@ -1,5 +1,12 @@
+# Core: every arm in the paper needs these.
 numpy>=1.24
-# optional but REQUIRED for the real W1b parity gate:
-# libcachesim
-# for data download: awscli, zstandard
-tqdm
+
+# Stage 2 / domains -- installed by default because the paper reports these arms:
+scikit-learn>=1.3        # oppcert.domains.substrate_control (LRB-like evictor, Baleen-like admission)
+
+# Optional, per arm. Install only if you run the arm named.
+# torch>=2.0             # oppcert.instrument.lstm_bar   -- the LSTM decoupled bar (Gate A kill-test)
+# tqdm                   # oppcert.domains.substrate_control --tqdm (progress only)
+# libcachesim            # oppcert.sim.invariants W1b/W1c -- third-party LRU / S3-FIFO parity check.
+#                        # Without it the parity gate prints SKIPPED and calls the pass provisional.
+# awscli, zstandard      # scripts/fetch_traces.sh -- downloading the public traces
