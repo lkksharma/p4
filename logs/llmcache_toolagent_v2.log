@@ -1,4 +1,4 @@
-[trace] /private/tmp/claude-501/-Users-primivista-Desktop-P4-CACHE/0c17f890-a164-450a-a9b7-79aa34f9ddb3/scratchpad/data/mooncake_toolagent.jsonl: 23,608 requests -> 409,616 block accesses, 183,300 unique blocks (reuse 55.3%), cache 1.0% = 1,833 blocks
+[trace] data/mooncake_toolagent.jsonl: 23,608 requests -> 409,616 block accesses, 183,300 unique blocks (reuse 55.3%), cache 1.0% = 1,833 blocks
 ==========================================================================
   W2   GAP -- LRU -> Belady headroom (guide: 10-25 OHR pts at 1%; <5 = no room)
 ==========================================================================
@@ -26,7 +26,7 @@
   [hazard] harvesting eval window [307,212,409,616)...
   [hazard] survival replay...
 
-  /private/tmp/claude-501/-Users-primivista-Desktop-P4-CACHE/0c17f890-a164-450a-a9b7-79aa34f9ddb3/scratchpad/data/mooncake_toolagent.jsonl   [hazard: markov3 tau=0.05 k=4]
+  data/mooncake_toolagent.jsonl   [hazard: markov3 tau=0.05 k=4]
   split  predictor [0,204,808)  hazard-train [204,808,307,212)  F2-eval [307,212,409,616)   horizon 20,480
   hazard-train emissions 141,126 (never 1.5%)   F2-eval emissions 90,548 (never 0.5%)
   survival events 144,506   median lifetime 16 req   S(100)=1.000
@@ -37,7 +37,7 @@
 
 
 ====================================================================================================
-  PHANTOM HEADROOM x LLM KV-CACHE SERVING -- /private/tmp/claude-501/-Users-primivista-Desktop-P4-CACHE/0c17f890-a164-450a-a9b7-79aa34f9ddb3/scratchpad/data/mooncake_toolagent.jsonl
+  PHANTOM HEADROOM x LLM KV-CACHE SERVING -- data/mooncake_toolagent.jsonl
   (turn-gated warming; ceiling vocab = physically warmable blocks; iso-BW)
 ====================================================================================================
   arm                               OHR  traffic   warmings   prec
